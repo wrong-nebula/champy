@@ -157,6 +157,7 @@ function applySpeciesSculpting(
   const isMorel = speciesId === 'morel';
   const isChanterelle = speciesId === 'chanterelle';
   const isParasol = speciesId === 'parasol';
+  const isMycena = speciesId === 'mycena';
 
   // Save pre-displacement normals & apply species-specific 3D surface sculpting
   for (let i = 0; i < vertCount; i++) {
@@ -272,6 +273,18 @@ function applySpeciesSculpting(
         smoothstep(0.62, 0.98, rNorm);
 
       disp = (umbo * 0.00055 + patchMask * 0.00048 + marginScallop * 0.00042) * pScale;
+    } else if (isMycena) {
+      // Mycena chlorophos: delicate translucent campanulate radial bell fluting + smooth scalloped edge bevel
+      const mycScale = clamp(capR / 0.022, 0.30, 1.15) * (0.40 + 0.60 * maturity);
+      const radialMask = smoothstep(0.18, 0.92, rNorm);
+      const flute = Math.sin(theta * 24.0 + bSeed) * radialMask * 0.00045;
+      const rimScallop =
+        (Math.sin(theta * 12.0 + bSeed) * 0.52 +
+          Math.sin(theta * 24.0 + bSeed) * 0.48) *
+        smoothstep(0.70, 0.99, rNorm) *
+        0.00024;
+      const edgeBevel = -smoothstep(0.84, 1.02, rNorm) * 0.00022;
+      disp = (flute + rimScallop + edgeBevel) * mycScale;
     } else {
       // Inkcap: longitudinal fibrous shaggy ridges + delicate deliquescent rim curl
       const inkScale = clamp(capR / 0.022, 0.30, 1.12) * (0.45 + 0.55 * maturity);
