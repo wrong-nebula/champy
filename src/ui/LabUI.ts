@@ -19,6 +19,8 @@ import {
 import { MicroscopeCanvas } from './MicroscopeCanvas.ts';
 import { TelemetryPlots } from './TelemetryPlots.ts';
 
+export type LightingMood = 'studio' | 'canopy' | 'backlit';
+
 export interface LabUICallbacks {
   onSpeciesChange(speciesId: SpeciesId): void;
   onSceneChange(preset: TerrariumScenePreset): void;
@@ -27,6 +29,7 @@ export interface LabUICallbacks {
   onReset(): void;
   onEnvChange(patch: Partial<EnvironmentState>): void;
   onViewChange(patch: Partial<ViewState>): void;
+  onLightingMoodChange?(mood: LightingMood): void;
   onDrainSoil(): void;
   onFloodSoil(): void;
   onCanvasPick(clientX: number, clientY: number): PickResult;
@@ -95,6 +98,12 @@ const XRAY_DEFS: { id: XRayFieldMode; label: string }[] = [
   { id: 'air_convection', label: 'Air ΔT' },
 ];
 
+const LIGHTING_MOOD_DEFS: { id: LightingMood; label: string; title: string }[] = [
+  { id: 'studio', label: 'Studio', title: 'Neutral botanical softbox & studio IBL' },
+  { id: 'canopy', label: 'Canopy', title: 'Warm dappled woodland sun & drifting foliage gobo' },
+  { id: 'backlit', label: 'Backlit', title: 'Dark-field obsidian spotlight & strong subsurface glow' },
+];
+
 function formatSimClock(simSec: number): string {
   if (simSec < 120) return `${simSec.toFixed(1)} s`;
   if (simSec < 7200) {
@@ -124,6 +133,7 @@ export class LabUI {
 
   private activeTool: BrushTool = 'orbit';
   private paused = false;
+  private currentMood: LightingMood = 'studio';
   private viewState: ViewState = {
     cameraYaw: 0.62,
     cameraPitch: 0.42,
@@ -173,6 +183,7 @@ export class LabUI {
   private layerMycBtn!: HTMLButtonElement;
   private layerSporeBtn!: HTMLButtonElement;
   private layerWindBtn!: HTMLButtonElement;
+  private moodBtns = new Map<LightingMood, HTMLButtonElement>();
 
   private sliceCheck!: HTMLInputElement;
   private sliceAxisXBtn!: HTMLButtonElement;
@@ -554,6 +565,30 @@ export class LabUI {
     layerSec.appendChild(pills);
     dock.appendChild(layerSec);
 
+    // Section 4: Lighting Mood Presets
+    const moodSec = document.createElement('div');
+    moodSec.className = 'sp-section';
+    moodSec.innerHTML = `<div class="sp-section-header"><span>Lighting Mood</span><span>Preset</span></div>`;
+    const moodGroup = document.createElement('div');
+    moodGroup.className = 'sp-mood-segment';
+    moodGroup.setAttribute('role', 'group');
+    moodGroup.setAttribute('aria-label', 'Lighting Mood');
+    for (const def of LIGHTING_MOOD_DEFS) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      const active = def.id === this.currentMood;
+      btn.className = 'sp-btn sp-mood-btn' + (active ? ' active' : '');
+      btn.textContent = def.label;
+      btn.title = def.title;
+      btn.dataset.mood = def.id;
+      btn.setAttribute('aria-pressed', String(active));
+      this.addListener(btn, 'click', () => this.setLightingMood(def.id));
+      this.moodBtns.set(def.id, btn);
+      moodGroup.appendChild(btn);
+    }
+    moodSec.appendChild(moodGroup);
+    dock.appendChild(moodSec);
+
     this.rootEl.appendChild(dock);
   }
 
@@ -868,6 +903,27 @@ export class LabUI {
     this.syncViewDOM();
   }
 
+  getLightingMood(): LightingMood {
+    return this.currentMood;
+  }
+
+  setLightingMood(mood: LightingMood): void {
+    if (mood !== 'studio' && mood !== 'canopy' && mood !== 'backlit') {
+      return;
+    }
+    this.currentMood = mood;
+    this.syncMoodDOM();
+    this.callbacks.onLightingMoodChange?.(mood);
+  }
+
+  private syncMoodDOM(): void {
+    for (const [id, btn] of this.moodBtns) {
+      const active = id === this.currentMood;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    }
+  }
+
   syncState(
     speciesId: SpeciesId,
     scene: TerrariumScenePreset,
@@ -922,6 +978,7 @@ export class LabUI {
     this.layerMycBtn.classList.toggle('active', v.showMycelium);
     this.layerSporeBtn.classList.toggle('active', v.showSpores);
     this.layerWindBtn.classList.toggle('active', v.showStreamlines);
+    this.syncMoodDOM();
 
     for (const [id, btn] of this.xrayBtns) {
       btn.classList.toggle('active', id === v.xrayMode);
