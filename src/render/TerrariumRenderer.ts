@@ -50,6 +50,7 @@ import {
   STREAMLINE_GLSL_FS,
   STREAMLINE_GLSL_VS,
   STREAMLINE_WGSL,
+  makeWgslSssMaskShader,
 } from './shaders.ts';
 import { FastSdfGiSystem, SDF_NX, type SdfVolumeBounds } from './FastSdfGi.ts';
 import { ProceduralSplatPass } from './ProceduralSplatPass.ts';
@@ -714,6 +715,8 @@ class WebGPUBackend {
   readonly format: GPUTextureFormat;
   private depthTex: GPUTexture | null = null;
   private depthTexView: GPUTextureView | null = null;
+  private sssMaskTex: GPUTexture | null = null;
+  private sssMaskView: GPUTextureView | null = null;
   private width = 1;
   private height = 1;
 
@@ -741,12 +744,15 @@ class WebGPUBackend {
   private simpleBindGroupLayout: GPUBindGroupLayout;
   private simpleBindGroup: GPUBindGroup;
   private occBindGroup: GPUBindGroup;
+  private sssMaskLayout: GPUBindGroupLayout;
+  private sssMaskBg: GPUBindGroup | null = null;
 
   private backdropPipe: GPURenderPipeline;
   private soilPipe: GPURenderPipeline;
   private mycPipe: GPURenderPipeline;
   private mycOccPipe: GPURenderPipeline;
   private mushPipe: GPURenderPipeline;
+  private sssMaskPipe: GPURenderPipeline;
   private solidPipe: GPURenderPipeline;
   private glassPipe: GPURenderPipeline;
   private linePipe: GPURenderPipeline;
@@ -949,6 +955,31 @@ class WebGPUBackend {
       multisample: { count: MSAA_SAMPLES },
     });
 
+    this.sssMaskLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', multisampled: MSAA_SAMPLES > 1 } },
+      ],
+    });
+    const sssMaskMod = device.createShaderModule({ code: makeWgslSssMaskShader(MSAA_SAMPLES) });
+    this.sssMaskPipe = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.sssMaskLayout] }),
+      vertex: {
+        module: sssMaskMod,
+        entryPoint: 'vs_sss_mask',
+        buffers: [{
+          arrayStride: 64,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x3' },
+            { shaderLocation: 3, offset: 36, format: 'float32x3' },
+            { shaderLocation: 4, offset: 48, format: 'float32x4' },
+          ],
+        }],
+      },
+      fragment: { module: sssMaskMod, entryPoint: 'fs_sss_mask', targets: [{ format: 'rgba8unorm' }] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+    });
+
     const solidMod = device.createShaderModule({ code: SOLID_WGSL });
     const solidBuffers: GPUVertexBufferLayout[] = [{
       arrayStride: 40,
@@ -1037,8 +1068,15 @@ class WebGPUBackend {
   resize(width: number, height: number): void {
     const w = Math.max(1, Math.floor(width));
     const h = Math.max(1, Math.floor(height));
-    if (w === this.width && h === this.height && this.depthTex && this.depthTexView) {
-      this.postPass.ensureTargets(w, h, this.depthTexView);
+    if (
+      w === this.width &&
+      h === this.height &&
+      this.depthTex &&
+      this.depthTexView &&
+      this.sssMaskTex &&
+      this.sssMaskView
+    ) {
+      this.postPass.ensureTargets(w, h, this.depthTexView, this.sssMaskView);
       return;
     }
     this.width = w;
@@ -1051,7 +1089,22 @@ class WebGPUBackend {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.depthTexView = this.depthTex.createView();
-    this.postPass.ensureTargets(w, h, this.depthTexView);
+
+    this.sssMaskTex?.destroy();
+    this.sssMaskTex = this.device.createTexture({
+      size: [w, h, 1],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.sssMaskView = this.sssMaskTex.createView();
+    this.sssMaskBg = this.device.createBindGroup({
+      layout: this.sssMaskLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuf } },
+        { binding: 1, resource: this.depthTexView },
+      ],
+    });
+    this.postPass.ensureTargets(w, h, this.depthTexView, this.sssMaskView);
   }
 
   private ensureTextures(nx: number, ny: number, nz: number, spNx: number, spNz: number): void {
@@ -1347,7 +1400,27 @@ class WebGPUBackend {
 
     pass.end();
 
-    // Stage 4 Half-Res HDR Bloom + Macro Bokeh DoF + ACES Filmic Composite -> Swapchain
+    // Stage 3b Occlusion-exact Mushroom SSS Mask Pass (depth-tested against scene depth)
+    if (this.sssMaskView && this.sssMaskBg) {
+      const maskPass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.sssMaskView,
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      if (mushVertCount > 0 && mushIndexCount > 0 && view.xrayMode === 'none') {
+        maskPass.setPipeline(this.sssMaskPipe);
+        maskPass.setBindGroup(0, this.sssMaskBg);
+        maskPass.setVertexBuffer(0, this.mushVertBuf);
+        maskPass.setIndexBuffer(this.mushIdxBuf, 'uint32');
+        maskPass.drawIndexed(mushIndexCount);
+      }
+      maskPass.end();
+    }
+
+    // Stage 4 Screen-Space Burley SSS + Half-Res HDR Bloom + Macro Bokeh DoF + ACES Filmic Composite -> Swapchain
     this.postPass.renderPost(
       encoder,
       swapView,
@@ -1371,6 +1444,7 @@ class WebGPUBackend {
     this.splatPass.dispose();
     this.sdfGi.dispose();
     this.depthTex?.destroy();
+    this.sssMaskTex?.destroy();
     this.soilTex?.destroy();
     this.sporePrintTex?.destroy();
     this.uniformBuf.destroy();

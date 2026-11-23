@@ -75,6 +75,93 @@ fn fs_bloom_blur(in: FullVertOut) -> @location(0) vec4<f32> {
 }
 `;
 
+const SSS_BURLEY_WGSL = /* wgsl */ `
+${POST_VS_WGSL}
+
+struct PostUniforms {
+  params0: vec4<f32>, // x = texelW, y = texelH, z = bloomThreshold, w = bloomStrength
+  params1: vec4<f32>, // x = focusDistM, y = dofStrength, z = xrayMode, w = sliceEnabled
+  params2: vec4<f32>, // x = near, y = far, z = blurDirX, w = blurDirY
+};
+
+@group(0) @binding(0) var<uniform> u: PostUniforms;
+@group(0) @binding(1) var srcHdrTex: texture_2d<f32>;
+@group(0) @binding(2) var sssMaskTex: texture_2d<f32>;
+@group(0) @binding(3) var depthMsaa: ${MSAA_SAMPLES > 1 ? 'texture_depth_multisampled_2d' : 'texture_depth_2d'};
+@group(0) @binding(4) var linearSamp: sampler;
+
+fn linearizeDepthSss(d: f32, nearZ: f32, farZ: f32) -> f32 {
+  return (nearZ * farZ) / max(farZ - d * (farZ - nearZ), 1e-4);
+}
+
+@fragment
+fn fs_burley_sss(in: FullVertOut) -> @location(0) vec4<f32> {
+  let hdrDims = vec2<i32>(textureDimensions(srcHdrTex));
+  let coord = clamp(vec2<i32>(in.clipPos.xy), vec2<i32>(0), hdrDims - vec2<i32>(1));
+  let centerHdr = textureLoad(srcHdrTex, coord, 0).rgb;
+
+  if (u.params1.z > 0.5) {
+    return vec4<f32>(centerHdr, 1.0);
+  }
+
+  let mask = textureLoad(sssMaskTex, coord, 0);
+  if (mask.r < 0.01) {
+    return vec4<f32>(centerHdr, 1.0);
+  }
+
+  let dDims = vec2<i32>(textureDimensions(depthMsaa));
+  let dCoord = clamp(coord, vec2<i32>(0), dDims - vec2<i32>(1));
+  let centerRawDepth = textureLoad(depthMsaa, dCoord, 0);
+  if (centerRawDepth >= 0.9999) {
+    return vec4<f32>(centerHdr, 1.0);
+  }
+
+  let nearZ = u.params2.x;
+  let farZ = u.params2.y;
+  let centerDist = linearizeDepthSss(centerRawDepth, nearZ, farZ);
+
+  // Project physical ~2.8 mm fungal scattering mean-free-path into screen-space pixels
+  let radiusPx = clamp((0.0028 * mask.g * f32(hdrDims.y) * 1.15) / max(centerDist, 0.06), 1.0, 7.2);
+  let stepUv = vec2<f32>(u.params0.x * u.params2.z, u.params0.y * u.params2.w) * (radiusPx * 0.25);
+  let stepPx = vec2<f32>(u.params2.z, u.params2.w) * (radiusPx * 0.25);
+
+  // RGB Normalized Burley mean-free-path ratios (warm red/amber in daylight; 525 nm emerald when bioluminescent)
+  let dRgb = mix(vec3<f32>(1.00, 0.52, 0.24), vec3<f32>(0.42, 1.00, 0.64), mask.b);
+  let w0 = (vec3<f32>(2.0)) / (dRgb * 0.35);
+  var acc = centerHdr * w0;
+  var wSum = w0;
+
+  for (var i = -4; i <= 4; i = i + 1) {
+    if (i == 0) {
+      continue;
+    }
+    let fi = f32(i);
+    let tapUv = clamp(in.uv + stepUv * fi, vec2<f32>(0.0), vec2<f32>(1.0));
+    let tapCoord = clamp(vec2<i32>(round(vec2<f32>(coord) + stepPx * fi)), vec2<i32>(0), hdrDims - vec2<i32>(1));
+    let tapMask = textureLoad(sssMaskTex, tapCoord, 0);
+    if (tapMask.r < 0.01) {
+      continue;
+    }
+    let tapRawDepth = textureLoad(depthMsaa, clamp(tapCoord, vec2<i32>(0), dDims - vec2<i32>(1)), 0);
+    let tapDist = linearizeDepthSss(tapRawDepth, nearZ, farZ);
+    let bilat = tapMask.r * exp(-abs(tapDist - centerDist) * 280.0);
+
+    let r = abs(fi) * 0.62;
+    let burley = (exp(vec3<f32>(-r) / dRgb) + exp(vec3<f32>(-r) / (3.0 * dRgb))) / (dRgb * (r + 0.35));
+    let w = burley * bilat;
+    let tapCol = textureSampleLevel(srcHdrTex, linearSamp, tapUv, 0.0).rgb;
+    acc += tapCol * w;
+    wSum += w;
+  }
+
+  let diffused = acc / max(wSum, vec3<f32>(1e-4));
+  let peak = max(centerHdr.r, max(centerHdr.g, centerHdr.b));
+  let specKeep = smoothstep(0.60, 1.55, peak) * (1.0 - mask.b * 0.72);
+  let blendAmt = clamp(mask.r * 0.60 * (1.0 - specKeep * 0.80), 0.0, 0.78);
+  return vec4<f32>(mix(centerHdr, diffused, blendAmt), 1.0);
+}
+`;
+
 const COMPOSITE_WGSL = /* wgsl */ `
 ${POST_VS_WGSL}
 
@@ -264,34 +351,47 @@ export class PostProcessPass {
   private hdrMsaaView: GPUTextureView | null = null;
   private hdrResolveTex: GPUTexture | null = null;
   private hdrResolveView: GPUTextureView | null = null;
+  private sssTempTex: GPUTexture | null = null;
+  private sssTempView: GPUTextureView | null = null;
+  private sssFinalTex: GPUTexture | null = null;
+  private sssFinalView: GPUTextureView | null = null;
   private bloomTexA: GPUTexture | null = null;
   private bloomViewA: GPUTextureView | null = null;
   private bloomTexB: GPUTexture | null = null;
   private bloomViewB: GPUTextureView | null = null;
 
+  private uniformSssHBuf: GPUBuffer;
+  private uniformSssVBuf: GPUBuffer;
   private uniformExtractBuf: GPUBuffer;
   private uniformBlurHBuf: GPUBuffer;
   private uniformBlurVBuf: GPUBuffer;
   private linearSampler: GPUSampler;
   private uniformScratch = new Float32Array(12);
 
+  private sssPipe: GPURenderPipeline;
   private extractPipe: GPURenderPipeline;
   private blurPipe: GPURenderPipeline;
   private compositePipe: GPURenderPipeline;
 
+  private sssLayout: GPUBindGroupLayout;
   private bloomLayout: GPUBindGroupLayout;
   private compositeLayout: GPUBindGroupLayout;
 
+  private sssHBg: GPUBindGroup | null = null;
+  private sssVBg: GPUBindGroup | null = null;
   private extractBg: GPUBindGroup | null = null;
   private blurHBg: GPUBindGroup | null = null;
   private blurVBg: GPUBindGroup | null = null;
   private compositeBg: GPUBindGroup | null = null;
   private cachedDepthView: GPUTextureView | null = null;
+  private cachedSssMaskView: GPUTextureView | null = null;
 
   constructor(device: GPUDevice, swapFormat: GPUTextureFormat) {
     this.device = device;
     this.swapFormat = swapFormat;
 
+    this.uniformSssHBuf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.uniformSssVBuf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.uniformExtractBuf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.uniformBlurHBuf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.uniformBlurVBuf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -301,6 +401,23 @@ export class PostProcessPass {
       minFilter: 'linear',
       addressModeU: 'clamp-to-edge',
       addressModeV: 'clamp-to-edge',
+    });
+
+    const sssMod = device.createShaderModule({ code: SSS_BURLEY_WGSL });
+    this.sssLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', multisampled: MSAA_SAMPLES > 1 } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      ],
+    });
+    this.sssPipe = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.sssLayout] }),
+      vertex: { module: sssMod, entryPoint: 'vs_full' },
+      fragment: { module: sssMod, entryPoint: 'fs_burley_sss', targets: [{ format: this.hdrFormat }] },
+      primitive: { topology: 'triangle-list' },
     });
 
     const bloomMod = device.createShaderModule({ code: BLOOM_WGSL });
@@ -343,7 +460,7 @@ export class PostProcessPass {
     });
   }
 
-  ensureTargets(width: number, height: number, depthView: GPUTextureView): void {
+  ensureTargets(width: number, height: number, depthView: GPUTextureView, sssMaskView: GPUTextureView): void {
     const w = Math.max(1, Math.floor(width));
     const h = Math.max(1, Math.floor(height));
     const hw = Math.max(1, Math.floor(w / 2));
@@ -354,6 +471,8 @@ export class PostProcessPass {
       h !== this.height ||
       !this.hdrMsaaTex ||
       !this.hdrResolveTex ||
+      !this.sssTempTex ||
+      !this.sssFinalTex ||
       !this.bloomTexA ||
       !this.bloomTexB
     ) {
@@ -364,6 +483,8 @@ export class PostProcessPass {
 
       this.hdrMsaaTex?.destroy();
       this.hdrResolveTex?.destroy();
+      this.sssTempTex?.destroy();
+      this.sssFinalTex?.destroy();
       this.bloomTexA?.destroy();
       this.bloomTexB?.destroy();
 
@@ -383,6 +504,20 @@ export class PostProcessPass {
       });
       this.hdrResolveView = this.hdrResolveTex.createView();
 
+      this.sssTempTex = this.device.createTexture({
+        size: [w, h, 1],
+        format: this.hdrFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this.sssTempView = this.sssTempTex.createView();
+
+      this.sssFinalTex = this.device.createTexture({
+        size: [w, h, 1],
+        format: this.hdrFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this.sssFinalView = this.sssFinalTex.createView();
+
       this.bloomTexA = this.device.createTexture({
         size: [hw, hh, 1],
         format: this.hdrFormat,
@@ -401,7 +536,7 @@ export class PostProcessPass {
         layout: this.bloomLayout,
         entries: [
           { binding: 0, resource: { buffer: this.uniformExtractBuf } },
-          { binding: 1, resource: this.hdrResolveView },
+          { binding: 1, resource: this.sssFinalView },
           { binding: 2, resource: this.linearSampler },
         ],
       });
@@ -422,15 +557,43 @@ export class PostProcessPass {
         ],
       });
       this.cachedDepthView = null;
+      this.cachedSssMaskView = null;
     }
 
-    if (this.cachedDepthView !== depthView && this.hdrResolveView && this.bloomViewA) {
+    if (
+      (this.cachedDepthView !== depthView || this.cachedSssMaskView !== sssMaskView) &&
+      this.hdrResolveView &&
+      this.sssTempView &&
+      this.sssFinalView &&
+      this.bloomViewA
+    ) {
       this.cachedDepthView = depthView;
+      this.cachedSssMaskView = sssMaskView;
+      this.sssHBg = this.device.createBindGroup({
+        layout: this.sssLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.uniformSssHBuf } },
+          { binding: 1, resource: this.hdrResolveView },
+          { binding: 2, resource: sssMaskView },
+          { binding: 3, resource: depthView },
+          { binding: 4, resource: this.linearSampler },
+        ],
+      });
+      this.sssVBg = this.device.createBindGroup({
+        layout: this.sssLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.uniformSssVBuf } },
+          { binding: 1, resource: this.sssTempView },
+          { binding: 2, resource: sssMaskView },
+          { binding: 3, resource: depthView },
+          { binding: 4, resource: this.linearSampler },
+        ],
+      });
       this.compositeBg = this.device.createBindGroup({
         layout: this.compositeLayout,
         entries: [
           { binding: 0, resource: { buffer: this.uniformExtractBuf } },
-          { binding: 1, resource: this.hdrResolveView },
+          { binding: 1, resource: this.sssFinalView },
           { binding: 2, resource: this.bloomViewA },
           { binding: 3, resource: depthView },
           { binding: 4, resource: this.linearSampler },
@@ -458,7 +621,18 @@ export class PostProcessPass {
     lightingMood = 0,
     realTimeSec = 0,
   ): void {
-    if (!this.bloomViewA || !this.bloomViewB || !this.extractBg || !this.blurHBg || !this.blurVBg || !this.compositeBg) {
+    if (
+      !this.sssTempView ||
+      !this.sssFinalView ||
+      !this.sssHBg ||
+      !this.sssVBg ||
+      !this.bloomViewA ||
+      !this.bloomViewB ||
+      !this.extractBg ||
+      !this.blurHBg ||
+      !this.blurVBg ||
+      !this.compositeBg
+    ) {
       return;
     }
 
@@ -475,6 +649,12 @@ export class PostProcessPass {
     u[7] = sliceEnabled ? 1.0 : 0.0;
     u[8] = 0.02;
     u[9] = 8.0;
+    u[10] = 1.0; u[11] = 0.0;
+    this.device.queue.writeBuffer(this.uniformSssHBuf, 0, u.buffer, u.byteOffset, 48);
+
+    u[10] = 0.0; u[11] = 1.0;
+    this.device.queue.writeBuffer(this.uniformSssVBuf, 0, u.buffer, u.byteOffset, 48);
+
     u[10] = lightingMood;
     u[11] = wrappedTime;
     this.device.queue.writeBuffer(this.uniformExtractBuf, 0, u.buffer, u.byteOffset, 48);
@@ -486,6 +666,38 @@ export class PostProcessPass {
 
     u[10] = 0.0; u[11] = 1.0;
     this.device.queue.writeBuffer(this.uniformBlurVBuf, 0, u.buffer, u.byteOffset, 48);
+
+    // 0a. Depth-aware Screen-Space Burley SSS horizontal pass -> sssTempTex
+    {
+      const p = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.sssTempView,
+          loadOp: 'clear',
+          storeOp: 'store',
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      p.setPipeline(this.sssPipe);
+      p.setBindGroup(0, this.sssHBg);
+      p.draw(3);
+      p.end();
+    }
+
+    // 0b. Depth-aware Screen-Space Burley SSS vertical pass -> sssFinalTex
+    {
+      const p = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.sssFinalView,
+          loadOp: 'clear',
+          storeOp: 'store',
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      p.setPipeline(this.sssPipe);
+      p.setBindGroup(0, this.sssVBg);
+      p.draw(3);
+      p.end();
+    }
 
     // 1. Half-res bloom extract -> bloomTexA
     {
@@ -555,8 +767,12 @@ export class PostProcessPass {
   dispose(): void {
     this.hdrMsaaTex?.destroy();
     this.hdrResolveTex?.destroy();
+    this.sssTempTex?.destroy();
+    this.sssFinalTex?.destroy();
     this.bloomTexA?.destroy();
     this.bloomTexB?.destroy();
+    this.uniformSssHBuf.destroy();
+    this.uniformSssVBuf.destroy();
     this.uniformExtractBuf.destroy();
     this.uniformBlurHBuf.destroy();
     this.uniformBlurVBuf.destroy();

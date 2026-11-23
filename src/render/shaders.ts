@@ -312,6 +312,24 @@ fn evalPcfShadow(worldPos: vec3<f32>, n: vec3<f32>) -> f32 {
   }
   return select(1.0, sum / 9.0, inBounds);
 }
+
+fn evalShadowThickness(worldPos: vec3<f32>, fallbackM: f32) -> f32 {
+  let lp = u.lightViewProj * vec4<f32>(worldPos, 1.0);
+  let uv = vec2<f32>(lp.x * 0.5 + 0.5, 0.5 - lp.y * 0.5);
+  let inBounds = u.speciesExtra.y > 0.5
+    && all(uv >= vec2<f32>(0.002))
+    && all(uv <= vec2<f32>(0.998))
+    && lp.z > 0.0
+    && lp.z < 1.0;
+  let baseCoord = clamp(vec2<i32>(uv * 2048.0), vec2<i32>(0), vec2<i32>(2046));
+  let z0 = textureLoad(shadowMapTex, baseCoord, 0);
+  let z1 = textureLoad(shadowMapTex, baseCoord + vec2<i32>(1, 0), 0);
+  let z2 = textureLoad(shadowMapTex, baseCoord + vec2<i32>(0, 1), 0);
+  let zEntry = (z0 + z1 + z2) * (1.0 / 3.0);
+  // ShadowMapPass uses ortho near = 0.05 m, far = 2.0 m -> linear depth span = 1.95 m
+  let dLight = max(0.0, (lp.z - zEntry) * 1.95);
+  return select(fallbackM, max(dLight, fallbackM * 0.38), inBounds);
+}
 `;
 }
 
@@ -1141,13 +1159,56 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
   let charlie = evalCharlieSheen(ndv, sheenRough);
   let sheen = sheenColor * charlie * sheenStrength * (0.35 + 0.65 * wrapNdl) * totalAo * mix(1.0, 0.10, noct);
 
-  // Thickness-modulated backlit waxy chitin SSS (dramatically amplified in Dark-Field Backlit mood)
-  let backDot = clamp(dot(v, -l + nLit * 0.38), 0.0, 1.0);
-  let backLight = pow(backDot, 2.2) * 0.85 + pow(backDot, 5.0) * 0.65;
-  let capThin = mix(0.38, 0.96, smoothstep(0.18, 0.96, rNorm));
-  let thicknessFactor = select(select(capThin, 1.05, partId == 2 || partId == 3), 0.34, partId == 0);
-  let sssBoost = mix(1.0, 2.85, isBacklitMood);
-  let sss = srgbToLinear(u.sssColor.rgb) * backLight * 0.42 * thicknessFactor * sssBoost * (0.35 + 0.65 * shadow) * mix(0.55, 1.0, gobo) * mix(1.0, 0.08, noct);
+  // Physical 3D SDF inward optical thickness (m) + shadow-map light-ray chord length
+  var dSdf = 0.0032;
+  if (u.sdfVolMax.w >= 0.5) {
+    let in0 = smoothstep(0.0025, -0.0025, sampleSdfDist(in.worldPos - nLit * 0.0025));
+    let in1 = smoothstep(0.0025, -0.0025, sampleSdfDist(in.worldPos - nLit * 0.0060));
+    let in2 = smoothstep(0.0025, -0.0025, sampleSdfDist(in.worldPos - nLit * 0.0120));
+    let in3 = smoothstep(0.0025, -0.0025, sampleSdfDist(in.worldPos - nLit * 0.0220));
+    dSdf = 0.0012 + 0.0028 * in0 + 0.0046 * in1 + 0.0072 * in2 + 0.0102 * in3;
+  } else {
+    dSdf = mix(0.011, 0.0022, smoothstep(0.18, 0.96, rNorm));
+  }
+  if (partId == 2) {
+    dSdf *= 0.72;
+  } else if (partId == 3) {
+    dSdf = 0.0014;
+  } else if (partId == 0) {
+    dSdf *= 1.25;
+  }
+  let dEffLight = evalShadowThickness(in.worldPos, dSdf);
+
+  // Live vertex turgor-hydration couples chitin cell refraction & scattering (turgid = waxy/translucent, drought = opaque)
+  let hydration = clamp((turgorPa - 0.85e5) / 2.15e5, 0.0, 1.15);
+  let dryMult = mix(3.15, 0.82, smoothstep(0.06, 0.92, hydration));
+  var sigmaBase = vec3<f32>(90.0, 165.0, 290.0); // Parasol chitin
+  if (speciesIdx == 1) {
+    sigmaBase = vec3<f32>(64.0, 128.0, 275.0); // Chanterelle deep apricot-gold translucency
+  } else if (speciesIdx == 2) {
+    sigmaBase = vec3<f32>(148.0, 232.0, 360.0); // Morel dense cellular ridges
+  } else if (speciesIdx == 3) {
+    sigmaBase = mix(
+      vec3<f32>(98.0, 162.0, 248.0),
+      vec3<f32>(420.0, 440.0, 480.0),
+      smoothstep(0.68, 0.98, rNorm),
+    );
+  } else if (speciesIdx == 4) {
+    sigmaBase = vec3<f32>(84.0, 62.0, 124.0); // Mycena thin celadon pellicle
+  }
+  let sigmaT = sigmaBase * dryMult;
+
+  // Wavelength-dependent Beer-Lambert subsurface transmittance (forward backlit + ambient wrap)
+  let backDot = clamp(dot(v, -l + nLit * 0.36), 0.0, 1.0);
+  let backPhase = pow(backDot, 2.3) * 0.85 + pow(backDot, 5.2) * 0.75;
+  let sssTint = mix(vec3<f32>(1.0), srgbToLinear(u.sssColor.rgb) * 1.45, 0.55);
+  let transLight = exp(-sigmaT * dEffLight);
+  let sssForward = transLight * sssTint * sunBase * backPhase
+    * mix(0.55, 1.0, gobo) * mix(1.0, 2.25, isBacklitMood) * mix(1.0, 0.06, noct) * 0.56;
+  let transAmb = exp(-sigmaT * (dSdf * 1.15));
+  let sssAmbient = transAmb * sssTint * (skyFill * 1.65 + gi * 0.32)
+    * mix(0.28, 0.44, clamp(isCanopyMood + isBacklitMood * 0.6, 0.0, 1.0)) * mix(1.0, 0.14, noct);
+  let sss = sssForward + sssAmbient;
 
   // Dual-lobe specular + Studio IBL environment reflections
   let ndh = max(dot(nLit, h), 0.0);
@@ -1200,14 +1261,15 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
       // Brightest on underside gills with subtle radial structure
       emitMask = 1.35 * mix(0.84, 1.08, 0.5 + 0.5 * sin(theta * 24.0 + bSeed));
     } else if (partId == 1) {
-      // Glowing along translucent fluted thin cap margin
+      // Glowing along translucent fluted thin cap margin modulated by internal 525 nm cap Beer-Lambert transmission
       let marginGlow = smoothstep(0.15, 0.95, rNorm);
+      let trans525 = exp(-sigmaT.g * 0.72 * dSdf);
       let fluteMod = select(
         0.92 + 0.08 * sin(theta * 24.0 + bSeed),
         0.72 + 0.38 * (0.5 + 0.5 * sin(theta * 24.0 + bSeed)),
         speciesIdx == 4,
       );
-      emitMask = mix(0.14, 0.96, marginGlow) * fluteMod;
+      emitMask = mix(0.10, 1.04, clamp(trans525 * 0.72 + marginGlow * 0.36, 0.0, 1.0)) * fluteMod;
     } else if (partId == 0) {
       // Subtle translucent glow gradient on upper stipe beneath the gills
       emitMask = mix(0.06, 0.62, smoothstep(0.35, 1.0, relY));
@@ -1929,3 +1991,89 @@ void main() {
   fragColor = vColor;
 }
 `;
+
+export function makeWgslSssMaskShader(msaaSamples: number): string {
+  const depthLoad = msaaSamples > 1
+    ? /* wgsl */ `
+  let d0 = textureLoad(depthMsaa, coord, 0);
+  let d1 = textureLoad(depthMsaa, coord, 1);
+  let d2 = textureLoad(depthMsaa, coord, 2);
+  let d3 = textureLoad(depthMsaa, coord, 3);
+  let sceneDepth = min(min(d0, d1), min(d2, d3));`
+    : /* wgsl */ `
+  let sceneDepth = textureLoad(depthMsaa, coord, 0);`;
+
+  return /* wgsl */ `
+${WGSL_COMMON}
+
+@group(0) @binding(0) var<uniform> u: SceneUniforms;
+@group(0) @binding(1) var depthMsaa: ${msaaSamples > 1 ? 'texture_depth_multisampled_2d' : 'texture_depth_2d'};
+
+struct SssMaskVertIn {
+  @location(0) pos: vec3<f32>,
+  @location(3) metrics: vec3<f32>,
+  @location(4) botUv: vec4<f32>,
+};
+
+struct SssMaskVertOut {
+  @builtin(position) clipPos: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+  @location(1) turgorPa: f32,
+  @location(2) partId: f32,
+  @location(3) rNorm: f32,
+};
+
+@vertex
+fn vs_sss_mask(v: SssMaskVertIn) -> SssMaskVertOut {
+  var out: SssMaskVertOut;
+  out.clipPos = u.viewProj * vec4<f32>(v.pos, 1.0);
+  out.worldPos = v.pos;
+  out.turgorPa = v.metrics.y;
+  out.partId = v.metrics.z;
+  out.rNorm = clamp(length(v.botUv.xy), 0.0, 1.35);
+  return out;
+}
+
+@fragment
+fn fs_sss_mask(in: SssMaskVertOut) -> @location(0) vec4<f32> {
+  if (isClippedBySlice(in.worldPos, u.sliceParams) || u.soilBoundsMax.w > 0.5) {
+    discard;
+  }
+  let dDims = vec2<i32>(textureDimensions(depthMsaa));
+  let coord = clamp(vec2<i32>(in.clipPos.xy), vec2<i32>(0), dDims - vec2<i32>(1));
+${depthLoad}
+  if (in.clipPos.z > sceneDepth + 0.00045) {
+    discard;
+  }
+
+  let partId = i32(floor(in.partId + 0.5));
+  let speciesIdx = i32(floor(u.speciesExtra.x + 0.5));
+  let hydration = clamp((in.turgorPa - 0.85e5) / 2.15e5, 0.0, 1.0);
+
+  var partWeight = 1.0;
+  if (partId == 2) {
+    partWeight = 0.72;
+  } else if (partId == 0) {
+    partWeight = 0.55;
+  } else if (partId == 3) {
+    partWeight = 0.22;
+  }
+
+  var speciesScale = 0.85;
+  if (speciesIdx == 1) {
+    speciesScale = 0.96;
+  } else if (speciesIdx == 2) {
+    speciesScale = 0.60;
+  } else if (speciesIdx == 3) {
+    speciesScale = mix(0.78, 0.18, smoothstep(0.66, 0.96, in.rNorm));
+  } else if (speciesIdx == 4) {
+    speciesScale = 1.00;
+  }
+
+  let sssStrength = partWeight * speciesScale * mix(0.18, 1.0, hydration);
+  let radiusScale = mix(0.28, 1.0, hydration) * speciesScale;
+  let biolumMix = clamp(u.biolumInfo.w * mix(0.15, 1.0, u.biolumInfo.y), 0.0, 1.0);
+  return vec4<f32>(sssStrength, radiusScale, biolumMix, 1.0);
+}
+`;
+}
