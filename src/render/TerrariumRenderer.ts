@@ -1991,7 +1991,9 @@ export class TerrariumRenderer {
           ? 1
           : snapshot.species.id === 'morel'
             ? 2
-            : 3;
+            : snapshot.species.id === 'mycena'
+              ? 4
+              : 3;
     u[80] = speciesIdx;
     u[81] = 1.0;
     u[82] = 0.02;

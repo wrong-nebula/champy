@@ -39,6 +39,9 @@ const BRUSH_TO_MATERIAL: Partial<Record<BrushTool, SoilMaterialId>> = {
   stone: SoilMaterialId.STONE,
 };
 
+/** Simulated seconds pre-grown on load and on species switch (~1.85 days: every preset has fruited). */
+const WARMUP_SIM_S = 160_000;
+
 async function bootstrap(): Promise<void> {
   const appEl = document.getElementById('app');
   if (!appEl) {
@@ -61,6 +64,8 @@ async function bootstrap(): Promise<void> {
   const callbacks: LabUICallbacks = {
     onSpeciesChange(speciesId: SpeciesId): void {
       engine.setSpecies(speciesId);
+      // Same warm-up as first load, so every species opens with primordia already fruiting
+      engine.fastForward(WARMUP_SIM_S);
       syncUiFromEngine();
       lastSnapshot = engine.getSnapshot();
       ui.update(lastSnapshot, true);
@@ -156,7 +161,7 @@ async function bootstrap(): Promise<void> {
   resizeObserver.observe(ui.canvas);
 
   // Brief initial warm-up so the terrarium opens alive with colonizing hyphae & budding primordia
-  engine.fastForward(160_000);
+  engine.fastForward(WARMUP_SIM_S);
   lastSnapshot = engine.getSnapshot();
 
   // Expose structured inspection & control handle for Tier-3 Playwright verification & console use
