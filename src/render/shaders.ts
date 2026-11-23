@@ -450,21 +450,23 @@ fn soilMaterialColor(
   var wetCol = vec3<f32>(0.08, 0.055, 0.035);
 
   if (matId == 0) {
-    // Sand: crisp quartz grains via cellular Voronoi
-    let speck = (gFine - 0.5) * 0.16 + (vor.x - 0.45) * 0.16 + (f3 - 0.5) * 0.10;
-    dryCol = vec3<f32>(0.64, 0.53, 0.37) + vec3<f32>(speck);
-    wetCol = vec3<f32>(0.30, 0.24, 0.15) + vec3<f32>(speck * 0.55);
+    // Sand: crisp high-frequency quartz grit grains
+    let qGrain = valueNoise3D(worldPos * 520.0);
+    let qSparkle = hash31(floor(worldPos * 560.0));
+    let speck = (qGrain - 0.5) * 0.24 + (qSparkle - 0.5) * 0.20 + (vor.x - 0.45) * 0.16 + (f3 - 0.5) * 0.08;
+    dryCol = vec3<f32>(0.68, 0.56, 0.39) + vec3<f32>(speck);
+    wetCol = vec3<f32>(0.38, 0.30, 0.19) + vec3<f32>(speck * 0.72);
   } else if (matId == 1) {
-    // Forest Silt-Loam: stratified dark earth with micro-aggregates
-    let band = (gStrata - 0.5) * 0.10 + (f3 - 0.5) * 0.09;
-    dryCol = vec3<f32>(0.38, 0.28, 0.19) * (0.88 + 0.24 * pores) + vec3<f32>(band);
-    wetCol = vec3<f32>(0.22, 0.16, 0.11) * (0.88 + 0.24 * pores) + vec3<f32>(band * 0.6);
+    // Forest Silt-Loam: stratified earth with micro-aggregates
+    let band = (gStrata - 0.5) * 0.12 + (f3 - 0.5) * 0.10;
+    dryCol = vec3<f32>(0.40, 0.30, 0.21) * (0.88 + 0.24 * pores) + vec3<f32>(band);
+    wetCol = vec3<f32>(0.26, 0.19, 0.13) * (0.88 + 0.26 * pores) + vec3<f32>(band * 0.75);
   } else if (matId == 2) {
     // Heavy Clay: dense terracotta-slate slicks with mineral cracking
     let crack = smoothstep(0.0, 0.09, vor.y);
-    let slick = (f3 - 0.5) * 0.07;
-    dryCol = (vec3<f32>(0.46, 0.30, 0.23) + vec3<f32>(slick)) * (0.84 + 0.16 * crack);
-    wetCol = (vec3<f32>(0.28, 0.18, 0.14) + vec3<f32>(slick * 0.6)) * (0.84 + 0.16 * crack);
+    let slick = (f3 - 0.5) * 0.08;
+    dryCol = (vec3<f32>(0.48, 0.32, 0.25) + vec3<f32>(slick)) * (0.84 + 0.16 * crack);
+    wetCol = (vec3<f32>(0.33, 0.22, 0.17) + vec3<f32>(slick * 0.70)) * (0.84 + 0.18 * crack);
   } else if (matId == 3) {
     // Forest Humus / Litter: rich dark organic mulch + high-frequency forest moss micro-mottling
     let litter = (gFine - 0.5) * 0.10 + (f3 - 0.5) * 0.08;
@@ -592,12 +594,19 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
   let stoneFrac = wMat[5];
 
   if (xrayMode == 0) {
-    // Fine horizontal sedimentary micro-banding across sand / silt-loam / clay strata
+    // Crisp horizontal sedimentary micro-banding & pale mineral grit flecks on cutaway strata
     let earthMask = clamp(1.0 - stoneFrac - wMat[4], 0.0, 1.0);
-    let strataWave = sin(samplePos.y * 520.0 + fbm3D(samplePos * 42.0) * 6.5) * 0.5 + 0.5;
-    let strataDetail = valueNoise3D(vec3<f32>(samplePos.x * 16.0, samplePos.y * 340.0, samplePos.z * 16.0));
-    let strataAmp = select(0.08, 0.20, !isTop);
-    albedo *= mix(1.0, (1.0 - strataAmp * 0.5) + strataAmp * (strataWave * 0.55 + strataDetail * 0.45), earthMask);
+    let strataWave = sin(samplePos.y * 540.0 + fbm3D(samplePos * 42.0) * 6.5) * 0.5 + 0.5;
+    let strataDetail = valueNoise3D(vec3<f32>(samplePos.x * 16.0, samplePos.y * 380.0, samplePos.z * 16.0));
+    let strataAmp = select(0.08, 0.36, !isTop);
+    albedo *= mix(1.0, (1.0 - strataAmp * 0.5) + strataAmp * (strataWave * 0.58 + strataDetail * 0.42), earthMask);
+
+    if (!isTop) {
+      let paleSeed = hash31(floor(samplePos * 480.0));
+      let paleVor = voronoi3D(samplePos * 460.0);
+      let paleFlecks = step(0.92, paleSeed) * (1.0 - smoothstep(0.06, 0.22, paleVor.x)) * (1.0 - wMat[4]);
+      albedo = mix(albedo, vec3<f32>(0.74, 0.68, 0.56), paleFlecks * 0.55);
+    }
   }
 
   // Triplanar fBm + Voronoi micro-bump normal
@@ -637,22 +646,22 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
     albedo = mix(albedo, srgbToLinear(u.sporePrintColor.rgb), printAlpha);
   }
 
-  // Hair-thin dead brown rootlets on cutaway faces
+  // Hair-thin dark reddish-brown rootlets on cutaway faces
   var rootMask = 0.0;
-  if (!isTop && xrayMode == 0 && samplePos.y > -0.078 && samplePos.y < -0.001) {
-    let depthRoot = smoothstep(-0.078, -0.016, samplePos.y) * (1.0 - smoothstep(-0.006, -0.001, samplePos.y));
+  if (!isTop && xrayMode == 0 && samplePos.y > -0.105 && samplePos.y < -0.001) {
+    let depthRoot = smoothstep(-0.105, -0.015, samplePos.y) * (1.0 - smoothstep(-0.006, -0.001, samplePos.y));
     let rootWarp = fbm3D(samplePos * 48.0) * 0.016;
     let uRoot = (samplePos.x + samplePos.z * 0.72) + rootWarp;
     let vRoot = samplePos.y * 1.4 + valueNoise3D(samplePos * 75.0) * 0.014;
     let p1 = abs(fract(uRoot * 38.0 + sin(vRoot * 160.0) * 0.35) - 0.5);
     let p2 = abs(fract((samplePos.z - samplePos.x * 0.55 + rootWarp) * 52.0 + cos(vRoot * 190.0) * 0.30) - 0.5);
-    let patch1 = smoothstep(0.35, 0.72, valueNoise3D(samplePos * 26.0 + vec3<f32>(1.9, 0.4, 3.1)));
-    let patch2 = smoothstep(0.42, 0.76, valueNoise3D(samplePos * 34.0 + vec3<f32>(7.1, 2.3, 5.7)));
-    let rLine1 = (1.0 - smoothstep(0.010, 0.028, p1)) * patch1;
-    let rLine2 = (1.0 - smoothstep(0.008, 0.024, p2)) * patch2 * 0.85;
+    let patch1 = smoothstep(0.32, 0.70, valueNoise3D(samplePos * 26.0 + vec3<f32>(1.9, 0.4, 3.1)));
+    let patch2 = smoothstep(0.38, 0.74, valueNoise3D(samplePos * 34.0 + vec3<f32>(7.1, 2.3, 5.7)));
+    let rLine1 = (1.0 - smoothstep(0.012, 0.036, p1)) * patch1;
+    let rLine2 = (1.0 - smoothstep(0.010, 0.030, p2)) * patch2 * 0.85;
     rootMask = clamp(max(rLine1, rLine2) * depthRoot * (1.0 - stoneFrac), 0.0, 1.0);
-    let rootCol = srgbToLinear(vec3<f32>(0.24, 0.14, 0.075));
-    albedo = mix(albedo, rootCol, rootMask * 0.78);
+    let rootCol = srgbToLinear(vec3<f32>(0.34, 0.14, 0.065));
+    albedo = mix(albedo, rootCol, rootMask * 0.88);
   }
 
   // Sharper wet capillary darkening fingers along cutaway borders
@@ -669,7 +678,7 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
   let l = normalize(u.lightDir.xyz);
   let h = normalize(l + v);
   let ndl = max(dot(bumpedN, l), 0.0);
-  let depthAo = mix(0.68, 1.0, smoothstep(0.0, 0.28, normPos.y)) * (1.0 - rootMask * 0.22);
+  let depthAo = mix(0.78, 1.0, smoothstep(0.0, 0.28, normPos.y)) * (1.0 - rootMask * 0.26);
 
   var color: vec3<f32>;
   if (xrayMode == 0) {
@@ -688,7 +697,8 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
     let isBacklitMood = smoothstep(1.2, 1.8, mood);
 
     let skyScale = mix(1.0, 0.38, isBacklitMood);
-    let sky = mix(vec3<f32>(0.032, 0.038, 0.044), vec3<f32>(0.11, 0.14, 0.19), bentN.y * 0.5 + 0.5) * skyScale;
+    let skyFloor = select(vec3<f32>(0.032, 0.038, 0.044), vec3<f32>(0.062, 0.068, 0.078), !isTop);
+    let sky = mix(skyFloor, vec3<f32>(0.13, 0.16, 0.21), bentN.y * 0.5 + 0.5) * skyScale;
     let sunTint = mix(vec3<f32>(0.96, 0.90, 0.80), vec3<f32>(1.04, 0.88, 0.62), isCanopyMood);
     let sun = sunTint * ndl * mix(0.22, 1.0, shadow) * gobo;
     let rimLight = pow(1.0 - max(dot(bumpedN, v), 0.0), 3.2) * u.postParams.w * 0.04;
@@ -1159,7 +1169,8 @@ fn vs_main(v: SolidVertIn) -> SolidVertOut {
 fn fs_main(in: SolidVertOut) -> @location(0) vec4<f32> {
   let nLen = length(in.worldNormal);
   if (nLen < 0.05) {
-    return in.color;
+    let lineFade = select(1.0, 0.38, u.padExtra.x > 1.5);
+    return vec4<f32>(in.color.rgb, in.color.a * lineFade);
   }
 
   let n = in.worldNormal / nLen;
