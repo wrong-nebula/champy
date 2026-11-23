@@ -41,8 +41,7 @@ export interface CapturedScreenshot {
 }
 
 const DEFAULT_CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const DEFAULT_ARTIFACT_DIR =
-  '/Users/samuelzeller/.gemini/antigravity/brain/946ec126-3ecb-44d8-9f98-fc1b468c03c2';
+const DEFAULT_ARTIFACT_DIR = path.resolve(process.cwd(), 'artifacts');
 
 async function launchChrome(): Promise<Browser> {
   const executablePath = process.env.CHROME_PATH || DEFAULT_CHROME_PATH;
