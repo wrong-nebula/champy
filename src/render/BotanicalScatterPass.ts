@@ -18,7 +18,7 @@ import {
 import { evalSoilSurfaceHeightM, evalSoilSurfaceNormal } from './terrainHeight.ts';
 import { WGSL_COMMON, makeWgslSdfGiHelpers, makeWgslShadowHelpers } from './shaders.ts';
 
-const MAX_INSTANCES = 4500;
+const MAX_INSTANCES = 3400;
 const FLOATS_PER_INST = 16; // instPosScale(4), instQuat(4), instColWet(4), instExtra(4)
 const FLOATS_PER_VERT = 10; // pos(3), normal(3), uv(2), vertMeta(2: kind, localParam)
 const SUBMESH_COUNT = 8; // 0:leaf, 1:moss, 2:needle, 3:barkSliver, 4:pebble, 5:twig, 6:barkArch, 7:rosette
@@ -1076,9 +1076,9 @@ export class BotanicalScatterPass {
     };
 
     const heroPositions: Array<[number, number]> = [];
-    const gridN = 56;
-    const spanX = soil.sizeX - 0.016;
-    const spanZ = soil.sizeZ - 0.016;
+    const gridN = 50;
+    const spanX = Math.max(0.05, soil.sizeX - 0.028);
+    const spanZ = Math.max(0.05, soil.sizeZ - 0.028);
 
     for (let gz = 0; gz < gridN; gz++) {
       for (let gx = 0; gx < gridN; gx++) {
@@ -1087,6 +1087,8 @@ export class BotanicalScatterPass {
         const rz = (gz + 0.14 + 0.72 * hash1(cellIdx * 23 + 2)) / gridN;
         const wx = (rx - 0.5) * spanX;
         const wz = (rz - 0.5) * spanZ;
+        const edgeDist = Math.min(halfX - Math.abs(wx), halfZ - Math.abs(wz));
+        const maxLeafScale = Math.max(0.004, (edgeDist - 0.0025) / 1.05);
 
         // Strictly clear of fruiting-body stipe bases (r >= 0.015 m)
         if (!isClearOfStipesAndObstacles(wx, wz, 0.0)) continue;
@@ -1149,9 +1151,10 @@ export class BotanicalScatterPass {
         const dark = 1.0 - wet * 0.25;
 
         // 1. Sparse hero micro-landmarks: moss-draped twigs & curled oak bark arches
-        const heroChance = woodProx > 0.22 ? 0.032 : mat === SoilMaterialId.HUMUS ? 0.011 : 0.0;
+        const heroChance = woodProx > 0.22 ? 0.036 : mat === SoilMaterialId.HUMUS ? 0.012 : 0.0;
         if (
-          buckets[5].length / 18 + buckets[6].length / 18 < 54
+          edgeDist >= 0.030
+          && buckets[5].length / 18 + buckets[6].length / 18 < 48
           && roll2 < heroChance
           && isClearOfStipesAndObstacles(wx, wz, 0.009)
         ) {
@@ -1205,7 +1208,7 @@ export class BotanicalScatterPass {
               r * dark, g * dark, b * dark, wet, seed, 0, 0.0, 1.0,
             );
           } else {
-            const scale = 0.0062 + sizeJ * 0.0034;
+            const scale = Math.min(maxLeafScale, 0.0062 + sizeJ * 0.0034);
             pushProp(
               2, wx, wy + 0.0002, wz, scale, nrm, yaw, pitch, rollA,
               (0.42 + tone * 0.4) * dark, (0.31 + tone * 0.25) * dark, 0.14 * dark,
@@ -1219,21 +1222,21 @@ export class BotanicalScatterPass {
         if (mat === SoilMaterialId.WOOD || woodProx > 0.24) {
           if (roll > 0.86) continue; // subtle gaps for exposed wood grain
           if (mossScore > 0.56 && roll < 0.46) {
-            const scale = 0.0052 + sizeJ * 0.0046;
+            const scale = Math.min(maxLeafScale, 0.0052 + sizeJ * 0.0046);
             pushProp(
               1, wx, wy - 0.0003, wz, scale, nrm, yaw, pitch, rollA,
               (0.18 + tone * 0.35) * dark, (0.41 + tone * 0.55) * dark, (0.12 + tone * 0.2) * dark,
               wet, seed, 0, clamp01((mossScore - 0.45) * 1.8), 1.0,
             );
           } else if (roll < 0.74) {
-            const scale = 0.0066 + sizeJ * 0.0046;
+            const scale = Math.min(maxLeafScale, 0.0066 + sizeJ * 0.0046);
             pushProp(
               3, wx, wy + 0.00015, wz, scale, nrm, yaw, pitch, rollA,
               (0.41 + tone * 0.45) * dark, (0.24 + tone * 0.30) * dark, (0.12 + tone * 0.15) * dark,
               wet, seed, 1, clamp01(mossScore), 1.0,
             );
           } else {
-            const scale = 0.0070 + sizeJ * 0.0038;
+            const scale = Math.min(maxLeafScale, 0.0070 + sizeJ * 0.0038);
             pushProp(
               2, wx, wy + 0.0002, wz, scale, nrm, yaw, pitch, rollA,
               (0.38 + tone * 0.4) * dark, (0.25 + tone * 0.3) * dark, 0.12 * dark,
@@ -1247,11 +1250,11 @@ export class BotanicalScatterPass {
         const onMossEdge = mossScore >= 0.50 && mossScore <= 0.63;
         if (
           onMossEdge
-          && roll2 < 0.21
+          && roll2 < 0.24
           && buckets[7].length / 18 < 64
           && isClearOfStipesAndObstacles(wx, wz, 0.004)
         ) {
-          const scale = 0.0070 + sizeJ * 0.0044;
+          const scale = Math.min(maxLeafScale, 0.0070 + sizeJ * 0.0044);
           pushProp(
             7, wx, wy, wz, scale, nrm, yaw, pitch * 0.6, rollA * 0.6,
             (0.18 + tone * 0.3) * dark, (0.43 + tone * 0.45) * dark, (0.12 + tone * 0.2) * dark,
@@ -1267,7 +1270,7 @@ export class BotanicalScatterPass {
           if (roll2 < 0.12 * (1.0 - islandCore)) {
             // Occasional leaf/needle caught on moss island fringe
             const isLeaf = roll < 0.55;
-            const scale = (isLeaf ? 0.0080 : 0.0068) + sizeJ * 0.0036;
+            const scale = Math.min(maxLeafScale, (isLeaf ? 0.0080 : 0.0068) + sizeJ * 0.0036);
             pushProp(
               isLeaf ? 0 : 2, wx, wy + 0.00025, wz, scale, nrm, yaw, pitch, rollA,
               (isLeaf ? 0.54 + tone * 0.5 : 0.36 + tone * 0.35) * dark,
@@ -1276,7 +1279,7 @@ export class BotanicalScatterPass {
               wet, seed, 0, islandCore, 1.0,
             );
           } else {
-            const scale = 0.0050 + (0.42 + 0.58 * islandCore) * (0.0024 + sizeJ * 0.0044);
+            const scale = Math.min(maxLeafScale, 0.0050 + (0.42 + 0.58 * islandCore) * (0.0024 + sizeJ * 0.0044));
             pushProp(
               1, wx, wy - 0.00035, wz, scale, nrm, yaw, pitch, rollA,
               (0.18 + tone * 0.35) * dark,
@@ -1304,7 +1307,7 @@ export class BotanicalScatterPass {
             } else {
               lr = 0.36; lg = 0.20; lb = 0.10; // weathered umber
             }
-            const scale = 0.0080 + sizeJ * 0.0052;
+            const scale = Math.min(maxLeafScale, 0.0080 + sizeJ * 0.0052);
             pushProp(
               0, wx, wy + 0.00042 + pocketCore * 0.00028, wz, scale, nrm, yaw, pitch * 1.15, rollA * 1.15,
               (lr + tone * 0.45) * dark, (lg + tone * 0.30) * dark, (lb + tone * 0.15) * dark,
@@ -1312,7 +1315,7 @@ export class BotanicalScatterPass {
             );
           } else if (roll2 < 0.92) {
             // Conifer needle
-            const scale = 0.0068 + sizeJ * 0.0040;
+            const scale = Math.min(maxLeafScale, 0.0068 + sizeJ * 0.0040);
             pushProp(
               2, wx, wy + 0.0002, wz, scale, nrm, yaw, pitch, rollA,
               (0.40 + tone * 0.35) * dark, (0.27 + tone * 0.25) * dark, 0.12 * dark,
@@ -1320,7 +1323,7 @@ export class BotanicalScatterPass {
             );
           } else {
             // Occasional bark sliver in leaf pocket
-            const scale = 0.0062 + sizeJ * 0.0038;
+            const scale = Math.min(maxLeafScale, 0.0062 + sizeJ * 0.0038);
             pushProp(
               3, wx, wy + 0.0001, wz, scale, nrm, yaw, pitch, rollA,
               (0.36 + tone * 0.35) * dark, (0.22 + tone * 0.25) * dark, 0.12 * dark,
@@ -1340,7 +1343,7 @@ export class BotanicalScatterPass {
           );
         } else if (roll < 0.10) {
           const isNeedle = roll2 > 0.35;
-          const scale = (isNeedle ? 0.0062 : 0.0022) + sizeJ * 0.0024;
+          const scale = Math.min(maxLeafScale, (isNeedle ? 0.0062 : 0.0022) + sizeJ * 0.0024);
           pushProp(
             isNeedle ? 2 : 4, wx, wy + (isNeedle ? 0.00015 : -0.0002), wz, scale, nrm, yaw, pitch, rollA,
             (isNeedle ? 0.35 + tone * 0.3 : 0.42 + tone * 0.25) * dark,
