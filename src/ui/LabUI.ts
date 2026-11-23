@@ -163,7 +163,7 @@ export class LabUI {
 
   // Pointer interaction state
   private pointerDown = false;
-  private pointerMode: 'orbit' | 'brush' = 'orbit';
+  private pointerMode: 'orbit' | 'pan' | 'brush' = 'orbit';
   private lastPointerX = 0;
   private lastPointerY = 0;
   private lastBrushTime = 0;
@@ -256,6 +256,7 @@ export class LabUI {
 
     // 4. Attach pointer/wheel controls
     this.attachPointerControls();
+    this.attachKeyboardShortcuts();
     this.syncViewDOM();
   }
 
@@ -839,6 +840,10 @@ export class LabUI {
 
   private attachPointerControls(): void {
     this.addListener(this.canvas, 'contextmenu', (e) => e.preventDefault());
+    // Stop the browser's middle-click autoscroll so middle-drag can pan
+    this.addListener(this.canvas, 'mousedown', (e) => {
+      if ((e as MouseEvent).button === 1) e.preventDefault();
+    });
 
     this.addListener(this.canvas, 'pointerdown', (e) => {
       const pe = e as PointerEvent;
@@ -847,8 +852,14 @@ export class LabUI {
       this.lastPointerX = pe.clientX;
       this.lastPointerY = pe.clientY;
 
-      const forceOrbit = pe.button === 2 || pe.shiftKey || this.activeTool === 'orbit';
-      if (forceOrbit) {
+      // Middle button, or secondary click (two-finger click on a trackpad), pans the view
+      const pan = pe.button === 1 || pe.button === 2;
+      const forceOrbit = pe.shiftKey || this.activeTool === 'orbit';
+      if (pan) {
+        pe.preventDefault();
+        this.pointerMode = 'pan';
+        this.canvas.classList.add('dragging');
+      } else if (forceOrbit) {
         this.pointerMode = 'orbit';
         this.canvas.classList.add('dragging');
       } else {
@@ -869,6 +880,8 @@ export class LabUI {
         const nextYaw = this.viewState.cameraYaw - dx * 0.0075;
         const nextPitch = Math.max(-0.55, Math.min(1.42, this.viewState.cameraPitch + dy * 0.0075));
         this.emitViewPatch({ cameraYaw: nextYaw, cameraPitch: nextPitch });
+      } else if (this.pointerMode === 'pan') {
+        this.panCamera(dx, dy);
       } else if (this.activeTool !== 'twig' && this.activeTool !== 'inspect_gill') {
         const now = performance.now();
         if (now - this.lastBrushTime > 40) {
@@ -903,6 +916,59 @@ export class LabUI {
       },
       { passive: false },
     );
+  }
+
+  /** Slide the orbit target in the camera's screen plane so the scene follows the cursor. */
+  private panCamera(dxPx: number, dyPx: number): void {
+    const { cameraYaw: yaw, cameraPitch: pitch, cameraDistance: dist, cameraTarget: t } = this.viewState;
+    const cp = Math.cos(pitch);
+    const sp = Math.sin(pitch);
+    const sy = Math.sin(yaw);
+    const cy = Math.cos(yaw);
+    // d = unit vector target -> eye; right = up x d; camUp = d x right
+    const d: [number, number, number] = [cp * sy, sp, cp * cy];
+    const right: [number, number, number] = [cy, 0, -sy];
+    const up: [number, number, number] = [
+      d[1] * right[2] - d[2] * right[1],
+      d[2] * right[0] - d[0] * right[2],
+      d[0] * right[1] - d[1] * right[0],
+    ];
+    // World metres per screen pixel at the target depth (38 deg vertical FOV)
+    const h = Math.max(1, this.canvas.clientHeight);
+    const k = (dist * 2 * Math.tan((19 * Math.PI) / 180)) / h;
+    const clamp = (v: number, lim: number) => Math.max(-lim, Math.min(lim, v));
+    this.emitViewPatch({
+      cameraTarget: [
+        clamp(t[0] - (right[0] * dxPx - up[0] * dyPx) * k, 0.4),
+        clamp(t[1] - (right[1] * dxPx - up[1] * dyPx) * k, 0.4),
+        clamp(t[2] - (right[2] * dxPx - up[2] * dyPx) * k, 0.4),
+      ],
+    });
+  }
+
+  private attachKeyboardShortcuts(): void {
+    this.addListener(window, 'keydown', (e) => {
+      const ke = e as KeyboardEvent;
+      if (ke.metaKey || ke.ctrlKey || ke.altKey) return;
+      const target = ke.target as HTMLElement | null;
+      const tag = target?.tagName;
+      const typing =
+        tag === 'TEXTAREA' || tag === 'SELECT' || target?.isContentEditable ||
+        (tag === 'INPUT' && !['range', 'checkbox', 'button'].includes((target as HTMLInputElement).type));
+      if (typing) return;
+      if (ke.key === 'Tab') {
+        ke.preventDefault();
+        const hidden = this.rootEl.classList.toggle('sp-ui-hidden');
+        if (hidden && document.activeElement instanceof HTMLElement) document.activeElement.blur();
+      } else if (ke.key === 'f' || ke.key === 'F') {
+        ke.preventDefault();
+        if (document.fullscreenElement) {
+          void document.exitFullscreen();
+        } else {
+          void this.rootEl.requestFullscreen?.().catch(() => undefined);
+        }
+      }
+    });
   }
 
   private applyBrushAt(clientX: number, clientY: number): void {

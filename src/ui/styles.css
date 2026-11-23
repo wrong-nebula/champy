@@ -829,3 +829,12 @@ input[type="range"].sp-range::-webkit-slider-thumb {
   background: rgba(148, 163, 184, 0.25);
   border-radius: 99px;
 }
+
+/* Tab: hide every instrument panel and leave only the viewport */
+.sp-glass {
+  transition: opacity 0.22s ease;
+}
+.sp-ui-hidden .sp-glass {
+  opacity: 0;
+  pointer-events: none;
+}
