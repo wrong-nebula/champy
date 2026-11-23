@@ -9,6 +9,8 @@
 //    Viridis/Inferno colormaps remain razor-sharp and calibrated.)
 // ============================================================================
 
+import { MSAA_SAMPLES } from './quality.ts';
+
 const POST_VS_WGSL = /* wgsl */ `
 struct FullVertOut {
   @builtin(position) clipPos: vec4<f32>,
@@ -85,7 +87,7 @@ struct PostUniforms {
 @group(0) @binding(0) var<uniform> u: PostUniforms;
 @group(0) @binding(1) var hdrTex: texture_2d<f32>;
 @group(0) @binding(2) var bloomTex: texture_2d<f32>;
-@group(0) @binding(3) var depthMsaa: texture_depth_multisampled_2d;
+@group(0) @binding(3) var depthMsaa: ${MSAA_SAMPLES > 1 ? 'texture_depth_multisampled_2d' : 'texture_depth_2d'};
 @group(0) @binding(4) var linearSamp: sampler;
 
 fn linearizeDepth(d: f32, nearZ: f32, farZ: f32) -> f32 {
@@ -329,7 +331,7 @@ export class PostProcessPass {
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', multisampled: true } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', multisampled: MSAA_SAMPLES > 1 } },
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
@@ -365,9 +367,10 @@ export class PostProcessPass {
       this.bloomTexA?.destroy();
       this.bloomTexB?.destroy();
 
+      // With MSAA off the scene renders straight into the resolve texture; keep a tiny placeholder
       this.hdrMsaaTex = this.device.createTexture({
-        size: [w, h, 1],
-        sampleCount: 4,
+        size: MSAA_SAMPLES > 1 ? [w, h, 1] : [1, 1, 1],
+        sampleCount: MSAA_SAMPLES,
         format: this.hdrFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       });

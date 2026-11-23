@@ -17,6 +17,7 @@ import {
 } from '../types/contract.ts';
 import { evalSoilSurfaceHeightM, evalSoilSurfaceNormal } from './terrainHeight.ts';
 import { WGSL_COMMON, makeWgslSdfGiHelpers, makeWgslShadowHelpers } from './shaders.ts';
+import { MSAA_SAMPLES } from './quality.ts';
 
 const MAX_INSTANCES = 3400;
 const FLOATS_PER_INST = 16; // instPosScale(4), instQuat(4), instColWet(4), instExtra(4)
@@ -1022,7 +1023,7 @@ export class BotanicalScatterPass {
       },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
   }
 

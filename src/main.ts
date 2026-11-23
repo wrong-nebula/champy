@@ -15,6 +15,7 @@ import {
 import { SimulationEngine } from './sim/engine.ts';
 import { TerrariumRenderer } from './render/TerrariumRenderer.ts';
 import { LabUI, type LabUICallbacks, type LightingMood } from './ui/LabUI.ts';
+import { DOF_OVERRIDE, renderPixelRatio } from './render/quality.ts';
 
 interface SporocarpApi {
   getBackend(): 'webgpu' | 'webgl2';
@@ -150,7 +151,7 @@ async function bootstrap(): Promise<void> {
 
   const syncCanvasSize = (): void => {
     if (!renderer) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = renderPixelRatio();
     const rect = ui.canvas.getBoundingClientRect();
     const w = Math.max(1, Math.floor(rect.width * dpr));
     const h = Math.max(1, Math.floor(rect.height * dpr));
@@ -221,7 +222,44 @@ async function bootstrap(): Promise<void> {
   let prevTime = performance.now();
   let smoothedFps = 60;
 
+  // Adaptive quality: on machines that can't hold ~45 FPS, drop the depth-of-field gather.
+  // Decided once, after a warm-up, from 2-second windows of real frame times (sticky, no flapping).
+  const DOF_MIN_FPS = 45;
+  const DOF_WARMUP_MS = 2500;
+  const DOF_WINDOW_MS = 2000;
+  let dofDecided = DOF_OVERRIDE !== null;
+  if (DOF_OVERRIDE !== null) renderer.setDofEnabled(DOF_OVERRIDE);
+  const startMs = performance.now();
+  let windowStart = 0;
+  let windowFrames = 0;
+  let slowWindows = 0;
+  const updateDofGovernor = (now: number, frameMs: number): void => {
+    if (dofDecided || now - startMs < DOF_WARMUP_MS) return;
+    if (frameMs > 250) {
+      // Tab switch or hitch: restart the window rather than counting it
+      windowStart = now;
+      windowFrames = 0;
+      return;
+    }
+    if (windowStart === 0) windowStart = now;
+    windowFrames++;
+    const elapsed = now - windowStart;
+    if (elapsed < DOF_WINDOW_MS) return;
+    const fps = (windowFrames * 1000) / elapsed;
+    windowStart = now;
+    windowFrames = 0;
+    slowWindows = fps < DOF_MIN_FPS ? slowWindows + 1 : 0;
+    if (slowWindows >= 2) {
+      renderer!.setDofEnabled(false);
+      dofDecided = true;
+      console.info(`[Champy] Depth of field disabled for performance (${fps.toFixed(0)} FPS)`);
+    } else if (now - startMs > DOF_WARMUP_MS + 4 * DOF_WINDOW_MS && slowWindows === 0) {
+      dofDecided = true;
+    }
+  };
+
   const frame = (now: number): void => {
+    updateDofGovernor(now, now - prevTime);
     const dtReal = Math.min(0.05, Math.max(0.001, (now - prevTime) / 1000));
     prevTime = now;
     const instFps = 1 / dtReal;

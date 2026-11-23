@@ -17,6 +17,7 @@ import {
 import type { Mat4 } from './math.ts';
 import { evalSoilSurfaceHeightM } from './terrainHeight.ts';
 import { WGSL_COMMON, makeWgslSdfGiHelpers } from './shaders.ts';
+import { MSAA_SAMPLES } from './quality.ts';
 
 export const MAX_SPLATS = 65536;
 const WG_SIZE = 256;
@@ -815,7 +816,7 @@ export class ProceduralSplatPass {
       },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
   }
 

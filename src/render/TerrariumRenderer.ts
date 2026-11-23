@@ -65,6 +65,7 @@ import {
   type CurvedMyceliumState,
 } from './MyceliumGeometry.ts';
 import type { LightingMood } from '../ui/LabUI.ts';
+import { MSAA_SAMPLES, renderPixelRatio } from './quality.ts';
 
 export type RendererBackend = 'webgpu' | 'webgl2';
 
@@ -867,7 +868,7 @@ class WebGPUBackend {
       fragment: { module: backMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     const soilMod = device.createShaderModule({ code: SOIL_WGSL });
@@ -888,7 +889,7 @@ class WebGPUBackend {
       fragment: { module: soilMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     const mycMod = device.createShaderModule({ code: MYCELIUM_WGSL });
@@ -914,7 +915,7 @@ class WebGPUBackend {
       fragment: { module: mycMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less-equal' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
     this.mycOccPipe = device.createRenderPipeline({
       layout: simpleLayout,
@@ -922,7 +923,7 @@ class WebGPUBackend {
       fragment: { module: mycMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'greater' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     const mushMod = device.createShaderModule({ code: MUSHROOM_WGSL });
@@ -945,7 +946,7 @@ class WebGPUBackend {
       fragment: { module: mushMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     const solidMod = device.createShaderModule({ code: SOLID_WGSL });
@@ -963,7 +964,7 @@ class WebGPUBackend {
       fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
     this.glassPipe = device.createRenderPipeline({
       layout: litLayout,
@@ -971,7 +972,7 @@ class WebGPUBackend {
       fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
     this.linePipe = device.createRenderPipeline({
       layout: litLayout,
@@ -979,7 +980,7 @@ class WebGPUBackend {
       fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'line-list' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less-equal' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     const streamMod = device.createShaderModule({ code: STREAMLINE_WGSL });
@@ -999,7 +1000,7 @@ class WebGPUBackend {
       fragment: { module: streamMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'line-list' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
-      multisample: { count: 4 },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     this.quadCornerBuf = device.createBuffer({ size: QUAD_CORNERS.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
@@ -1045,7 +1046,7 @@ class WebGPUBackend {
     this.depthTex?.destroy();
     this.depthTex = this.device.createTexture({
       size: [w, h, 1],
-      sampleCount: 4,
+      sampleCount: MSAA_SAMPLES,
       format: 'depth24plus',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
@@ -1247,13 +1248,20 @@ class WebGPUBackend {
 
     const swapView = this.context.getCurrentTexture().createView();
     const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view: this.postPass.getHdrMsaaView(),
-        resolveTarget: this.postPass.getHdrResolveView(),
-        clearValue: { r: 0.011, g: 0.015, b: 0.023, a: 1.0 },
-        loadOp: 'clear',
-        storeOp: 'discard',
-      }],
+      colorAttachments: [MSAA_SAMPLES > 1
+        ? {
+            view: this.postPass.getHdrMsaaView(),
+            resolveTarget: this.postPass.getHdrResolveView(),
+            clearValue: { r: 0.011, g: 0.015, b: 0.023, a: 1.0 },
+            loadOp: 'clear',
+            storeOp: 'discard',
+          }
+        : {
+            view: this.postPass.getHdrResolveView(),
+            clearValue: { r: 0.011, g: 0.015, b: 0.023, a: 1.0 },
+            loadOp: 'clear',
+            storeOp: 'store',
+          }],
       depthStencilAttachment: {
         view: this.depthTexView,
         depthClearValue: 1.0,
@@ -1888,7 +1896,7 @@ export class TerrariumRenderer {
   }
 
   resize(width: number, height: number): void {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = renderPixelRatio();
     this.cssWidth = Math.max(1, width);
     this.cssHeight = Math.max(1, height);
     this.pixelWidth = Math.max(1, Math.floor(this.cssWidth * dpr));
@@ -1899,6 +1907,17 @@ export class TerrariumRenderer {
     }
     this.gpuBackend?.resize(this.pixelWidth, this.pixelHeight);
     this.glBackend?.resize(this.pixelWidth, this.pixelHeight);
+  }
+
+  private dofEnabled = true;
+
+  /** Toggle the macro bokeh depth-of-field gather in the composite pass. */
+  setDofEnabled(enabled: boolean): void {
+    this.dofEnabled = enabled;
+  }
+
+  isDofEnabled(): boolean {
+    return this.dofEnabled;
   }
 
   setLightingMood(mood: LightingMood): void {
@@ -2024,7 +2043,7 @@ export class TerrariumRenderer {
     const moodIdx = lightingMoodIndex(this.lightingMood);
     const realTimeSec = ((performance.now() - this.startTimeMs) * 0.001) % 600;
     u[84] = focusDistM;
-    u[85] = 0.28;
+    u[85] = this.dofEnabled ? 0.28 : 0.0; // macro bokeh DoF strength (0 skips the gather)
     u[86] = 0.14;
     u[87] = 1.0;
     u[88] = moodIdx;
