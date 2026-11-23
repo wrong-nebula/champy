@@ -270,6 +270,7 @@ export class LabUI {
       chanterelle: 'Chanterelle',
       morel: 'Morel',
       inkcap: 'Ink Cap',
+      mycena: 'Mycena',
     };
     for (const sid of speciesOrder) {
       const btn = document.createElement('button');

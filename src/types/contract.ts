@@ -83,7 +83,7 @@ export interface SolidObstacle {
   endZ: number;
 }
 
-export type SpeciesId = 'parasol' | 'chanterelle' | 'morel' | 'inkcap';
+export type SpeciesId = 'parasol' | 'chanterelle' | 'morel' | 'inkcap' | 'mycena';
 export type HymeniumType = 'gills' | 'false-folds' | 'honeycomb' | 'dense-gills';
 
 export interface SpeciesPreset {
@@ -135,6 +135,7 @@ export interface SpeciesPreset {
   stipeColor: [number, number, number];
   sssColor: [number, number, number];
   sporePrintColor: [number, number, number];
+  biolumGain?: number;
 }
 
 export const SPECIES_PRESETS: Record<SpeciesId, SpeciesPreset> = {
@@ -309,6 +310,50 @@ export const SPECIES_PRESETS: Record<SpeciesId, SpeciesPreset> = {
     stipeColor: [0.96, 0.95, 0.92],
     sssColor: [0.96, 0.85, 0.76],
     sporePrintColor: [0.08, 0.08, 0.10],
+  },
+  mycena: {
+    id: 'mycena',
+    name: 'Glowing Bonnet',
+    scientificName: 'Mycena chlorophos',
+    description: 'Bioluminescent celadon-fluted bonnet emitting 525 nm 3-hydroxyhispidin photons fueled by oxygen, metabolic carbon, and a 24 h circadian rhythm.',
+    phiStipe: 1.35e-10,
+    yieldPressurePa: 2.0e5,
+    wiltPressurePa: 1.35e5,
+    maxStipeHeightM: 0.075,
+    stipeBaseRadiusM: 0.0032,
+    gravitropismGain: 2.6,
+    phototropismGain: 0.55,
+    co2KmPpm: 1600,
+    co2StipeBoost: 0.55,
+    maxCapRadiusM: 0.028,
+    alphaRadial: 1.0,
+    alphaCircumferential: 1.12,
+    shellThicknessM: 0.0010,
+    youngsModulusPa: 6.5e6,
+    poissonRatio: 0.35,
+    coreFoundationStiffness: 1.6e5,
+    targetCurvature: 24.0,
+    hymeniumType: 'gills',
+    gillDepthM: 0.0038,
+    hasPartialVeil: false,
+    veilFractureStressPa: 4.0e5,
+    pinCarbonThresholdKg: 1.1e-5,
+    pinTurgorThresholdPa: 2.7e5,
+    pinHumidityMin: 0.78,
+    pinTempMinC: 8,
+    pinTempMaxC: 28,
+    pinInhibitionRadiusM: 0.036,
+    sporeRadiusM: 4.0e-6,
+    bullerDropRadiusM: 2.3e-6,
+    sporeDensityKgM3: 1120,
+    launchEfficiency: 0.21,
+    transpirationCoeff: 1.5e-4,
+    capColor: [0.84, 0.91, 0.84],
+    gillColor: [0.76, 0.96, 0.80],
+    stipeColor: [0.86, 0.92, 0.87],
+    sssColor: [0.42, 0.96, 0.56],
+    sporePrintColor: [0.88, 0.94, 0.89],
+    biolumGain: 1.0,
   },
 };
 
@@ -642,6 +687,28 @@ export interface TelemetrySample {
   fps: number;
 }
 
+export interface BiolumEmitter {
+  x: number;
+  y: number;
+  z: number;
+  intensity: number;
+  radiusM: number;
+  kind: 'body' | 'foxfire';
+}
+
+export interface BioluminescenceState {
+  enabled: boolean;
+  circadianPhase01: number;
+  circadianFactor: number;
+  tempFactor: number;
+  meanO2Factor: number;
+  luciferinPoolNorm: number;
+  photonFluxCm2S: number;
+  peakWavelengthNm: number;
+  bodyGlow: Float32Array;
+  emitters: BiolumEmitter[];
+}
+
 export interface SimulationSnapshot {
   simTimeSec: number;
   species: SpeciesPreset;
@@ -655,6 +722,7 @@ export interface SimulationSnapshot {
   spores: SporeParticleBuffers;
   sporePrint: SporePrintGrid;
   bullerMicro: BullerMicroViewState;
+  biolum?: BioluminescenceState;
   telemetry: TelemetrySample;
   telemetryHistory: TelemetrySample[];
 }
