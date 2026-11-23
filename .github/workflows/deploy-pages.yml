@@ -1,4 +1,4 @@
-name: Deploy SPOROCARP to GitHub Pages
+name: Deploy Champy to GitHub Pages
 
 on:
   push:
