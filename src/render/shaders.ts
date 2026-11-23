@@ -1,15 +1,15 @@
 // ============================================================================
-// SPOROCARP — Hand-Crafted WGSL (WebGPU) & GLSL ES 3.00 (WebGL2) Shaders
+// SPOROCARP — Hand-Crafted WGSL (WebGPU HDR) & GLSL ES 3.00 (WebGL2 Fallback)
 // Implements:
-//   1. Domain-Warped Soil Cross-Section, Razor Slice, Spore Print & Fast-SDF GI
-//   2. 3D Branching Mycelial Network (Billboarded Filaments + Subterranean Glow)
-//   3. Waxy Chitin SSS + Fast-SDF-AO + Bent Normals + 2-Bounce GI Mushroom Shader
-//   4. Solid Obstacles (Twigs/Stones with SDF AO/GI) & Museum Glass Terrarium
+//   0. Studio Gradient Backdrop
+//   1. Domain-Warped Voronoi/POM Soil Cross-Section, Razor Slice & Fast-SDF GI
+//   2. Depth-Cued 3D Branching Mycelial Network (HDR linear glow)
+//   3. Botanical Species PBR + Waxy Chitin SSS + PCF Shadows + Fast-SDF-AO/GI
+//   4. Solid Obstacles (Twigs/Stones) & Physical Glass w/ Humidity Condensation
 //   5. Airborne Spore Cloud (WebGL2 fallback / non-splat path)
 //   6. Dressaire Evaporative Buoyant Wind Streamlines
 // ============================================================================
 
-// Shared WGSL struct + colormap + noise + slice + ACES tone mapper
 export const WGSL_COMMON = /* wgsl */ `
 struct SceneUniforms {
   viewProj: mat4x4<f32>,
@@ -25,6 +25,10 @@ struct SceneUniforms {
   sdfVolMax: vec4<f32>,       // xyz = sdf max, w = giEnabled (1.0 = active)
   camRight: vec4<f32>,        // xyz = camera right, w = viewportWidthPx
   camUp: vec4<f32>,           // xyz = camera up, w = viewportHeightPx
+  lightViewProj: mat4x4<f32>, // directional 2048x2048 shadow matrix
+  speciesExtra: vec4<f32>,  // x = speciesIdx (0..3), y = shadowEnabled, z = near, w = far
+  postParams: vec4<f32>,    // x = focusDistM, y = dofStrength, z = bloomStrength, w = rimStrength
+  padExtra: vec4<f32>,
 };
 
 fn isClippedBySlice(p: vec3<f32>, sliceParams: vec4<f32>) -> bool {
@@ -41,6 +45,12 @@ fn hash31(p: vec3<f32>) -> f32 {
   var q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
   q += vec3<f32>(dot(q, q.yxz + vec3<f32>(33.33)));
   return fract((q.x + q.y) * q.z);
+}
+
+fn hash33(p: vec3<f32>) -> vec3<f32> {
+  var q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
+  q += dot(q, q.yxz + vec3<f32>(33.33));
+  return fract((q.xxy + q.yxx) * q.zyx);
 }
 
 fn valueNoise3D(p: vec3<f32>) -> f32 {
@@ -64,6 +74,49 @@ fn valueNoise3D(p: vec3<f32>) -> f32 {
   return mix(nxy0, nxy1, u.z);
 }
 
+fn fbm3D(p: vec3<f32>) -> f32 {
+  var v = 0.0;
+  var amp = 0.5;
+  var freq = 1.0;
+  for (var i = 0; i < 3; i = i + 1) {
+    v += amp * valueNoise3D(p * freq);
+    freq *= 2.07;
+    amp *= 0.5;
+  }
+  return v;
+}
+
+// Cellular 3D Voronoi returning vec2(F1, F2 - F1) for soil pores & morel pits
+fn voronoi3D(p: vec3<f32>) -> vec2<f32> {
+  let n = floor(p);
+  let f = fract(p);
+  var f1 = 8.0;
+  var f2 = 8.0;
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        let g = vec3<f32>(f32(dx), f32(dy), f32(dz));
+        let o = hash33(n + g);
+        let r = g + o - f;
+        let d = dot(r, r);
+        if (d < f1) {
+          f2 = f1;
+          f1 = d;
+        } else if (d < f2) {
+          f2 = d;
+        }
+      }
+    }
+  }
+  let s1 = sqrt(f1);
+  let s2 = sqrt(f2);
+  return vec2<f32>(s1, s2 - s1);
+}
+
+fn srgbToLinear(c: vec3<f32>) -> vec3<f32> {
+  return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
+}
+
 fn colormapViridis(tIn: f32) -> vec3<f32> {
   let t = clamp(tIn, 0.0, 1.0);
   let c0 = vec3<f32>(0.2777, 0.0054, 0.3340);
@@ -73,7 +126,7 @@ fn colormapViridis(tIn: f32) -> vec3<f32> {
   let c4 = vec3<f32>(6.2282, 14.1799, 56.6905);
   let c5 = vec3<f32>(4.7763, -13.7451, -65.3530);
   let c6 = vec3<f32>(-5.4354, 4.6458, 26.3124);
-  return clamp(c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6))))), vec3<f32>(0.0), vec3<f32>(1.0));
+  return srgbToLinear(clamp(c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6))))), vec3<f32>(0.0), vec3<f32>(1.0)));
 }
 
 fn colormapInferno(tIn: f32) -> vec3<f32> {
@@ -85,11 +138,13 @@ fn colormapInferno(tIn: f32) -> vec3<f32> {
   let c4 = vec3<f32>(0.9554, 0.4876, 0.1072);
   let c5 = vec3<f32>(0.9883, 0.9983, 0.6449);
   let s = t * 5.0;
-  if (s < 1.0) { return mix(c0, c1, s); }
-  if (s < 2.0) { return mix(c1, c2, s - 1.0); }
-  if (s < 3.0) { return mix(c2, c3, s - 2.0); }
-  if (s < 4.0) { return mix(c3, c4, s - 3.0); }
-  return mix(c4, c5, s - 4.0);
+  var c = c5;
+  if (s < 1.0) { c = mix(c0, c1, s); }
+  else if (s < 2.0) { c = mix(c1, c2, s - 1.0); }
+  else if (s < 3.0) { c = mix(c2, c3, s - 2.0); }
+  else if (s < 4.0) { c = mix(c3, c4, s - 3.0); }
+  else { c = mix(c4, c5, s - 4.0); }
+  return srgbToLinear(c);
 }
 
 fn colormapCoolwarm(tIn: f32) -> vec3<f32> {
@@ -98,30 +153,12 @@ fn colormapCoolwarm(tIn: f32) -> vec3<f32> {
   let mid = vec3<f32>(0.84, 0.87, 0.90);
   let warm = vec3<f32>(0.92, 0.34, 0.16);
   if (t < 0.5) {
-    return mix(cool, mid, t * 2.0);
+    return srgbToLinear(mix(cool, mid, t * 2.0));
   }
-  return mix(mid, warm, (t - 0.5) * 2.0);
-}
-
-fn acesFilmic(x: vec3<f32>) -> vec3<f32> {
-  let a = 2.51;
-  let b = 0.03;
-  let c = 2.43;
-  let d = 0.59;
-  let e = 0.14;
-  return clamp(
-    (x * (a * x + vec3<f32>(b))) / (x * (c * x + vec3<f32>(d)) + vec3<f32>(e)),
-    vec3<f32>(0.0),
-    vec3<f32>(1.0),
-  );
-}
-
-fn srgbEncode(lin: vec3<f32>) -> vec3<f32> {
-  return pow(clamp(lin, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
+  return srgbToLinear(mix(mid, warm, (t - 0.5) * 2.0));
 }
 `;
 
-// Reusable Fast-SDF-AO + Bent Normal + Soft Shadow + 2-Bounce World Radiance GI helpers
 export function makeWgslSdfGiHelpers(
   sdfTexBinding: number,
   sampName: string,
@@ -157,8 +194,6 @@ fn sdfGradNormal(p: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
   return select(fallback, g / len, len > 1e-5);
 }
 
-// 4-tap normal-offset Fast-SDF-AO + SDF-gradient Bent Normal
-// Returns vec4(bentNormal.xyz, aoScalar)
 fn evalFastSdfAO(p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
   if (u.sdfVolMax.w < 0.5) {
     return vec4<f32>(n, 1.0);
@@ -176,7 +211,6 @@ fn evalFastSdfAO(p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
   return vec4<f32>(bentN, ao);
 }
 
-// Sphere-traced soft SDF shadow with contact hardening
 fn evalSdfSoftShadow(p: vec3<f32>, l: vec3<f32>) -> f32 {
   if (u.sdfVolMax.w < 0.5) {
     return 1.0;
@@ -199,7 +233,6 @@ fn evalSdfSoftShadow(p: vec3<f32>, l: vec3<f32>) -> f32 {
   return res;
 }
 
-// 4-cone hemisphere lookup into 2-bounce World Radiance Volume (radVolTex)
 fn evalSdfGI(p: vec3<f32>, n: vec3<f32>, bentN: vec3<f32>) -> vec3<f32> {
   if (u.sdfVolMax.w < 0.5) {
     return vec3<f32>(0.0);
@@ -230,8 +263,72 @@ fn evalSdfGI(p: vec3<f32>, n: vec3<f32>, bentN: vec3<f32>) -> vec3<f32> {
 `;
 }
 
+export function makeWgslShadowHelpers(
+  shadowMapBinding: number,
+  shadowSampBinding: number,
+): string {
+  return /* wgsl */ `
+@group(0) @binding(${shadowMapBinding}) var shadowMapTex: texture_depth_2d;
+@group(0) @binding(${shadowSampBinding}) var shadowSamp: sampler_comparison;
+
+fn evalPcfShadow(worldPos: vec3<f32>, n: vec3<f32>) -> f32 {
+  if (u.speciesExtra.y < 0.5) {
+    return 1.0;
+  }
+  let biasPos = worldPos + n * 0.0018;
+  let lp = u.lightViewProj * vec4<f32>(biasPos, 1.0);
+  let uv = vec2<f32>(lp.x * 0.5 + 0.5, 0.5 - lp.y * 0.5);
+  let refZ = lp.z - 0.00055;
+  let inBounds = all(uv >= vec2<f32>(0.005)) && all(uv <= vec2<f32>(0.995)) && refZ > 0.0 && refZ < 1.0;
+  let safeUv = clamp(uv, vec2<f32>(0.005), vec2<f32>(0.995));
+  let safeZ = clamp(refZ, 0.0, 0.9999);
+  let texel = 1.0 / 2048.0;
+  var sum = 0.0;
+  for (var dy = -1; dy <= 1; dy = dy + 1) {
+    for (var dx = -1; dx <= 1; dx = dx + 1) {
+      let off = vec2<f32>(f32(dx), f32(dy)) * texel * 1.3;
+      sum += textureSampleCompareLevel(shadowMapTex, shadowSamp, safeUv + off, safeZ);
+    }
+  }
+  return select(1.0, sum / 9.0, inBounds);
+}
+`;
+}
+
 // ----------------------------------------------------------------------------
-// 1. SOIL CROSS-SECTION & RAZOR SLICE SHADER (WGSL)
+// 0. STUDIO GRADIENT BACKDROP SHADER (WGSL HDR)
+// ----------------------------------------------------------------------------
+export const BACKDROP_WGSL = /* wgsl */ `
+struct BackVertOut {
+  @builtin(position) clipPos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> BackVertOut {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0)
+  );
+  var out: BackVertOut;
+  out.clipPos = vec4<f32>(pos[vid], 0.99999, 1.0);
+  out.uv = pos[vid] * 0.5 + 0.5;
+  return out;
+}
+
+@fragment
+fn fs_main(in: BackVertOut) -> @location(0) vec4<f32> {
+  let d = length((in.uv - vec2<f32>(0.5, 0.45)) * vec2<f32>(1.18, 1.0));
+  let glow = exp(-d * d * 2.6);
+  let edge = vec3<f32>(0.011, 0.015, 0.023);
+  let center = vec3<f32>(0.042, 0.060, 0.084);
+  return vec4<f32>(mix(edge, center, glow), 1.0);
+}
+`;
+
+// ----------------------------------------------------------------------------
+// 1. SOIL CROSS-SECTION, HEIGHTFIELD & RAZOR SLICE SHADER (WGSL HDR)
 // ----------------------------------------------------------------------------
 export const SOIL_WGSL = /* wgsl */ `
 ${WGSL_COMMON}
@@ -241,6 +338,7 @@ ${WGSL_COMMON}
 @group(0) @binding(2) var linearSampler: sampler;
 @group(0) @binding(3) var sporePrintTex: texture_2d<f32>;
 ${makeWgslSdfGiHelpers(4, 'linearSampler', 5)}
+${makeWgslShadowHelpers(6, 7)}
 
 struct SoilVertIn {
   @location(0) pos: vec3<f32>,
@@ -265,60 +363,76 @@ fn vs_main(v: SoilVertIn) -> SoilVertOut {
   return out;
 }
 
-fn soilMaterialColor(matId: i32, worldPos: vec3<f32>, wetness: f32, o2Norm: f32, isTop: bool) -> vec3<f32> {
-  let gFine = valueNoise3D(worldPos * 165.0);
-  let gMed = valueNoise3D(worldPos * 55.0);
+fn soilHeightAt(p: vec3<f32>) -> f32 {
+  let f = fbm3D(p * 110.0);
+  let v = voronoi3D(p * 185.0);
+  return f * 0.55 + (1.0 - smoothstep(0.0, 0.65, v.x)) * 0.45;
+}
+
+fn soilMaterialColor(
+  matId: i32,
+  worldPos: vec3<f32>,
+  wetness: f32,
+  o2Norm: f32,
+  isTop: bool,
+  vor: vec2<f32>,
+  f3: f32,
+) -> vec3<f32> {
+  let gFine = valueNoise3D(worldPos * 210.0);
   let gStrata = valueNoise3D(vec3<f32>(worldPos.x * 16.0, worldPos.y * 85.0, worldPos.z * 16.0));
+  let pores = smoothstep(0.05, 0.55, vor.x);
 
   var dryCol = vec3<f32>(0.24, 0.17, 0.11);
   var wetCol = vec3<f32>(0.08, 0.055, 0.035);
 
   if (matId == 0) {
-    // Sand: speckled warm quartz
-    let speck = (gFine - 0.5) * 0.16 + (gMed - 0.5) * 0.08;
-    dryCol = vec3<f32>(0.62, 0.52, 0.36) + vec3<f32>(speck);
-    wetCol = vec3<f32>(0.29, 0.23, 0.15) + vec3<f32>(speck * 0.55);
+    // Sand: crisp quartz grains via cellular Voronoi
+    let speck = (gFine - 0.5) * 0.16 + (vor.x - 0.45) * 0.16 + (f3 - 0.5) * 0.10;
+    dryCol = vec3<f32>(0.64, 0.53, 0.37) + vec3<f32>(speck);
+    wetCol = vec3<f32>(0.30, 0.24, 0.15) + vec3<f32>(speck * 0.55);
   } else if (matId == 1) {
-    // Forest Silt-Loam: stratified chocolate earth
-    let band = (gStrata - 0.5) * 0.09 + (gFine - 0.5) * 0.06;
-    dryCol = vec3<f32>(0.27, 0.19, 0.12) + vec3<f32>(band);
-    wetCol = vec3<f32>(0.095, 0.065, 0.042) + vec3<f32>(band * 0.5);
+    // Forest Silt-Loam: stratified dark earth with micro-aggregates
+    let band = (gStrata - 0.5) * 0.10 + (f3 - 0.5) * 0.09;
+    dryCol = vec3<f32>(0.38, 0.28, 0.19) * (0.88 + 0.24 * pores) + vec3<f32>(band);
+    wetCol = vec3<f32>(0.22, 0.16, 0.11) * (0.88 + 0.24 * pores) + vec3<f32>(band * 0.6);
   } else if (matId == 2) {
-    // Heavy Clay: terracotta-slate smooth dense pockets
-    let slick = (gMed - 0.5) * 0.06;
-    dryCol = vec3<f32>(0.39, 0.25, 0.19) + vec3<f32>(slick);
-    wetCol = vec3<f32>(0.18, 0.11, 0.085) + vec3<f32>(slick * 0.5);
+    // Heavy Clay: dense terracotta-slate slicks with mineral cracking
+    let crack = smoothstep(0.0, 0.09, vor.y);
+    let slick = (f3 - 0.5) * 0.07;
+    dryCol = (vec3<f32>(0.46, 0.30, 0.23) + vec3<f32>(slick)) * (0.84 + 0.16 * crack);
+    wetCol = (vec3<f32>(0.28, 0.18, 0.14) + vec3<f32>(slick * 0.6)) * (0.84 + 0.16 * crack);
   } else if (matId == 3) {
-    // Forest Humus / Litter: deep rich espresso organic mulch + moss flecks on top
-    let litter = (gFine - 0.5) * 0.09;
-    dryCol = vec3<f32>(0.14, 0.10, 0.07) + vec3<f32>(litter);
-    wetCol = vec3<f32>(0.045, 0.032, 0.022) + vec3<f32>(litter * 0.45);
+    // Forest Humus / Litter: rich dark organic mulch + high-frequency forest moss micro-mottling
+    let litter = (gFine - 0.5) * 0.10 + (f3 - 0.5) * 0.08;
+    dryCol = vec3<f32>(0.26, 0.19, 0.13) * (0.84 + 0.28 * pores) + vec3<f32>(litter);
+    wetCol = vec3<f32>(0.15, 0.11, 0.075) * (0.84 + 0.28 * pores) + vec3<f32>(litter * 0.55);
     if (isTop) {
-      let moss = smoothstep(0.42, 0.76, gMed * 0.65 + gFine * 0.35);
-      dryCol = mix(dryCol, vec3<f32>(0.10, 0.21, 0.075), moss * 0.68);
-      wetCol = mix(wetCol, vec3<f32>(0.055, 0.14, 0.045), moss * 0.78);
+      let fineMoss = fbm3D(worldPos * 145.0) * 0.65 + gFine * 0.35;
+      let moss = smoothstep(0.42, 0.78, fineMoss);
+      dryCol = mix(dryCol, vec3<f32>(0.24, 0.42, 0.15), moss * 0.62);
+      wetCol = mix(wetCol, vec3<f32>(0.16, 0.30, 0.10), moss * 0.68);
     }
   } else if (matId == 4) {
-    // Rotting Oak Log: fibrous grain + concentric heartwood rings
-    let rings = sin(length(worldPos.yz * 72.0 + vec2<f32>(3.0, 5.0)) + gMed * 4.5) * 0.5 + 0.5;
-    let fiber = valueNoise3D(vec3<f32>(worldPos.x * 22.0, worldPos.y * 140.0, worldPos.z * 140.0));
-    let woodVar = (rings * 0.6 + fiber * 0.4 - 0.5) * 0.15;
-    dryCol = vec3<f32>(0.36, 0.22, 0.12) + vec3<f32>(woodVar);
-    wetCol = vec3<f32>(0.15, 0.085, 0.045) + vec3<f32>(woodVar * 0.6);
+    // Rotting Oak Log: concentric heartwood growth rings + fibrous grain
+    let rings = sin(length(worldPos.yz * 76.0 + vec2<f32>(3.0, 5.0)) + f3 * 4.8) * 0.5 + 0.5;
+    let fiber = valueNoise3D(vec3<f32>(worldPos.x * 24.0, worldPos.y * 165.0, worldPos.z * 165.0));
+    let woodVar = (rings * 0.58 + fiber * 0.42 - 0.5) * 0.18;
+    dryCol = vec3<f32>(0.46, 0.29, 0.16) + vec3<f32>(woodVar);
+    wetCol = vec3<f32>(0.27, 0.16, 0.09) + vec3<f32>(woodVar * 0.65);
   } else {
     // Impermeable Stone: speckled granite + moss cap near surface
-    let grain = (gFine - 0.5) * 0.15 + (gMed - 0.5) * 0.08;
+    let grain = (gFine - 0.5) * 0.14 + (vor.y - 0.2) * 0.12;
     dryCol = vec3<f32>(0.36, 0.38, 0.40) + vec3<f32>(grain);
     wetCol = vec3<f32>(0.21, 0.23, 0.25) + vec3<f32>(grain * 0.7);
     if (worldPos.y > -0.025) {
-      let moss = smoothstep(0.48, 0.78, gMed);
-      dryCol = mix(dryCol, vec3<f32>(0.13, 0.24, 0.09), moss * 0.58);
+      let moss = smoothstep(0.45, 0.76, f3);
+      dryCol = mix(dryCol, vec3<f32>(0.11, 0.23, 0.08), moss * 0.62);
     }
   }
 
   var col = mix(dryCol, wetCol, clamp(wetness, 0.0, 1.0));
   let hypoxia = smoothstep(0.32, 0.05, o2Norm) * step(f32(matId), 4.5);
-  col = mix(col, vec3<f32>(0.06, 0.11, 0.16), hypoxia * 0.35);
+  col = mix(col, vec3<f32>(0.05, 0.10, 0.15), hypoxia * 0.35);
   return col;
 }
 
@@ -328,10 +442,12 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
   if (in.flags > 1.5) {
     let n = normalize(in.worldNormal);
     let l = normalize(u.lightDir.xyz);
+    let v = normalize(u.cameraPos.xyz - in.worldPos);
+    let h = normalize(l + v);
     let ndl = max(dot(n, l), 0.0);
-    let base = vec3<f32>(0.026, 0.034, 0.046);
-    let col = base * (0.55 + 0.65 * ndl);
-    return vec4<f32>(srgbEncode(acesFilmic(col)), 1.0);
+    let spec = pow(max(dot(n, h), 0.0), 48.0) * 0.06;
+    let base = srgbToLinear(vec3<f32>(0.055, 0.072, 0.095));
+    return vec4<f32>(base * (0.45 + 0.75 * ndl) + vec3<f32>(spec), 1.0);
   }
 
   let isSlice = in.flags > 0.5;
@@ -345,16 +461,37 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
   let dimsF = vec3<f32>(u.soilDims.x, u.soilDims.z, u.soilDims.y);
   let dimsI = vec3<i32>(i32(u.soilDims.x), i32(u.soilDims.z), i32(u.soilDims.y));
 
-  // Unwarped continuous scientific fields
   let smoothSample = textureSampleLevel(soilTex, linearSampler, uvw, 0.0);
   let wetness = smoothSample.g;
   let xrayVal = smoothSample.b;
   let o2Norm = smoothSample.a;
 
-  // Domain-warped 8-corner trilinear material blending (eliminates blocky voxel boundaries)
-  let w1 = valueNoise3D(in.worldPos * 26.0 + vec3<f32>(1.7, 3.1, 5.3));
-  let w2 = valueNoise3D(in.worldPos * 26.0 + vec3<f32>(11.2, 7.4, 2.9));
-  let w3 = valueNoise3D(in.worldPos * 26.0 + vec3<f32>(4.6, 9.8, 13.1));
+  let xrayMode = i32(floor(u.soilBoundsMax.w + 0.5));
+  let rawN = normalize(in.worldNormal);
+  let n = select(rawN, -rawN, isSlice && !frontFacing);
+  let isTop = n.y > 0.5;
+  let v = normalize(u.cameraPos.xyz - in.worldPos);
+
+  // Subtle 3-step tangent-space Parallax Occlusion Mapping (POM) on natural vertical cutaway walls
+  var samplePos = in.worldPos;
+  if (!isTop && !isSlice && xrayMode == 0) {
+    let upRef = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+    let t1 = normalize(cross(upRef, n));
+    let t2 = cross(n, t1);
+    let viewTan = vec3<f32>(dot(v, t1), dot(v, t2), max(dot(v, n), 0.25));
+    let pomDir = (t1 * viewTan.x + t2 * viewTan.y) / viewTan.z;
+    var hWalk = 0.0;
+    for (var step = 0; step < 3; step = step + 1) {
+      let pStep = in.worldPos - pomDir * (hWalk * 0.0020);
+      hWalk = mix(hWalk, 1.0 - soilHeightAt(pStep), 0.55);
+    }
+    samplePos = in.worldPos - pomDir * (hWalk * 0.0018);
+  }
+
+  // Domain-warped 8-corner trilinear material blending
+  let w1 = valueNoise3D(samplePos * 26.0 + vec3<f32>(1.7, 3.1, 5.3));
+  let w2 = valueNoise3D(samplePos * 26.0 + vec3<f32>(11.2, 7.4, 2.9));
+  let w3 = valueNoise3D(samplePos * 26.0 + vec3<f32>(4.6, 9.8, 13.1));
   let warp = (vec3<f32>(w1, w2, w3) - vec3<f32>(0.5)) * (0.95 / dimsF);
   let uvwMat = clamp(uvw + warp, vec3<f32>(0.0), vec3<f32>(0.9999));
 
@@ -379,43 +516,43 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
     }
   }
 
-  let rawN = normalize(in.worldNormal);
-  let n = select(rawN, -rawN, isSlice && !frontFacing);
-  let isTop = n.y > 0.5;
+  let f3 = fbm3D(samplePos * 62.0);
+  let vor = select(vec2<f32>(0.45, 0.25), voronoi3D(samplePos * 185.0), xrayMode == 0);
+
   var albedo = vec3<f32>(0.0);
   for (var m = 0; m < 6; m = m + 1) {
     if (wMat[m] > 0.001) {
-      albedo += soilMaterialColor(m, in.worldPos, wetness, o2Norm, isTop) * wMat[m];
+      albedo += soilMaterialColor(m, samplePos, wetness, o2Norm, isTop, vor, f3) * wMat[m];
     }
   }
   let stoneFrac = wMat[5];
 
-  // Triplanar procedural micro-bump normal perturbation
+  // Triplanar fBm + Voronoi micro-bump normal
   let upRef = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
   let t1 = normalize(cross(upRef, n));
   let t2 = cross(n, t1);
-  let epsB = 0.0022;
-  let h0 = valueNoise3D(in.worldPos * 140.0) * 0.65 + valueNoise3D(in.worldPos * 380.0) * 0.35;
-  let hx = valueNoise3D((in.worldPos + t1 * epsB) * 140.0) * 0.65 + valueNoise3D((in.worldPos + t1 * epsB) * 380.0) * 0.35;
-  let hz = valueNoise3D((in.worldPos + t2 * epsB) * 140.0) * 0.65 + valueNoise3D((in.worldPos + t2 * epsB) * 380.0) * 0.35;
-  let bumpStrength = mix(0.65, 0.25, wetness * 0.5);
+  let epsB = 0.0020;
+  let h0 = fbm3D(samplePos * 145.0);
+  let hx = fbm3D((samplePos + t1 * epsB) * 145.0);
+  let hz = fbm3D((samplePos + t2 * epsB) * 145.0);
+  let bumpStrength = mix(0.85, 0.35, wetness * 0.5);
   let bumpedN = normalize(n - (t1 * (hx - h0) + t2 * (hz - h0)) * bumpStrength);
 
-  let xrayMode = i32(floor(u.soilBoundsMax.w + 0.5));
+  albedo = srgbToLinear(albedo);
   var emissive = vec3<f32>(0.0);
   if (xrayMode == 1) {
     let mapped = colormapViridis(xrayVal);
-    albedo = mix(albedo * 0.25, mapped, select(0.78, 0.92, isSlice));
-    emissive = mapped * select(0.10, 0.22, isSlice);
+    albedo = mix(albedo * 0.22, mapped, select(0.78, 0.92, isSlice));
+    emissive = mapped * select(0.08, 0.18, isSlice);
   } else if (xrayMode == 2) {
     let mapped = colormapInferno(xrayVal);
-    albedo = mix(albedo * 0.22, mapped, select(0.80, 0.94, isSlice));
-    emissive = mapped * select(0.12, 0.24, isSlice);
+    albedo = mix(albedo * 0.20, mapped, select(0.80, 0.94, isSlice));
+    emissive = mapped * select(0.10, 0.20, isSlice);
   } else if (xrayMode == 3) {
     let mapped = colormapViridis(xrayVal);
     albedo = mix(albedo * 0.35, mapped * 0.55, select(0.45, 0.65, isSlice));
   } else if (xrayMode == 4) {
-    albedo = mix(albedo * 0.35, vec3<f32>(0.05, 0.08, 0.12), 0.55);
+    albedo = mix(albedo * 0.35, vec3<f32>(0.015, 0.025, 0.045), 0.55);
   } else if (xrayMode == 5) {
     albedo = albedo * 0.72;
   }
@@ -424,36 +561,42 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
   if (isTop && xrayMode == 0) {
     let spVal = textureSampleLevel(sporePrintTex, linearSampler, vec2<f32>(normPos.x, normPos.z), 0.0).r;
     let printAlpha = clamp(spVal * 1.45, 0.0, 0.92);
-    albedo = mix(albedo, u.sporePrintColor.rgb, printAlpha);
+    albedo = mix(albedo, srgbToLinear(u.sporePrintColor.rgb), printAlpha);
+  }
+
+  // Subtle wet capillary soil-glass meniscus darkening along top cutaway border
+  if (!isTop && !isSlice && xrayMode == 0) {
+    let meniscus = (1.0 - smoothstep(-0.015, 0.002, in.worldPos.y)) * wetness;
+    albedo *= 1.0 - meniscus * 0.26;
   }
 
   let l = normalize(u.lightDir.xyz);
-  let v = normalize(u.cameraPos.xyz - in.worldPos);
   let h = normalize(l + v);
   let ndl = max(dot(bumpedN, l), 0.0);
-  let depthAo = mix(0.74, 1.0, smoothstep(0.0, 0.28, normPos.y));
+  let depthAo = mix(0.68, 1.0, smoothstep(0.0, 0.28, normPos.y));
 
   var color: vec3<f32>;
-  if (xrayMode == 0 && (isTop || in.worldPos.y >= -0.045)) {
-    // Fast-SDF-AO + Soft SDF Shadow + 2-Bounce Radiance Volume GI on surface & upper slice
-    let giBlend = smoothstep(-0.045, -0.004, in.worldPos.y);
-    let aoBent = evalFastSdfAO(in.worldPos + n * 0.006, bumpedN);
+  if (xrayMode == 0) {
+    let giBlend = smoothstep(-0.048, -0.003, in.worldPos.y);
+    let aoBent = evalFastSdfAO(in.worldPos + n * 0.005, bumpedN);
     let bentN = aoBent.xyz;
     let sdfAo = mix(1.0, aoBent.w, giBlend);
-    let shadow = mix(1.0, evalSdfSoftShadow(in.worldPos + n * 0.007, l), giBlend);
+    let pcfSh = evalPcfShadow(in.worldPos, n);
+    let sdfSh = evalSdfSoftShadow(in.worldPos + n * 0.007, l);
+    let shadow = mix(1.0, min(pcfSh, mix(0.36, 1.0, sdfSh)), giBlend);
     let gi = evalSdfGI(in.worldPos + n * 0.008, bumpedN, bentN) * giBlend;
 
-    let sky = mix(vec3<f32>(0.08, 0.09, 0.10), vec3<f32>(0.24, 0.28, 0.35), bentN.y * 0.5 + 0.5);
-    let sun = vec3<f32>(1.08, 1.02, 0.92) * ndl * mix(0.20, 1.0, shadow);
-    let wetSpec = pow(max(dot(bumpedN, h), 0.0), 36.0) * wetness * 0.22 * (1.0 - stoneFrac) * shadow * sdfAo;
-    color = albedo * ((sky + sun) * sdfAo + gi * 0.65) * depthAo + vec3<f32>(wetSpec);
+    let sky = mix(vec3<f32>(0.032, 0.038, 0.044), vec3<f32>(0.11, 0.14, 0.19), bentN.y * 0.5 + 0.5);
+    let sun = vec3<f32>(0.96, 0.90, 0.80) * ndl * mix(0.22, 1.0, shadow);
+    let rimLight = pow(1.0 - max(dot(bumpedN, v), 0.0), 3.2) * u.postParams.w * 0.04;
+    let wetSpec = pow(max(dot(bumpedN, h), 0.0), 42.0) * wetness * 0.14 * (1.0 - stoneFrac) * shadow * sdfAo;
+    color = albedo * ((sky + sun) * sdfAo + gi * 0.50 + vec3<f32>(rimLight)) * depthAo + vec3<f32>(wetSpec);
   } else {
-    let hemi = 0.26 + 0.20 * (bumpedN.y * 0.5 + 0.5);
-    let wetSpec = pow(max(dot(bumpedN, h), 0.0), 36.0) * wetness * 0.18 * (1.0 - stoneFrac);
-    color = albedo * (hemi + 0.88 * ndl) * depthAo + vec3<f32>(wetSpec) + emissive;
+    let hemi = 0.14 + 0.10 * (bumpedN.y * 0.5 + 0.5);
+    let wetSpec = pow(max(dot(bumpedN, h), 0.0), 36.0) * wetness * 0.08 * (1.0 - stoneFrac);
+    color = albedo * (hemi + 0.85 * ndl) * depthAo + vec3<f32>(wetSpec) + emissive;
   }
 
-  // Razor slice optical perimeter hairline highlight
   if (isSlice) {
     var edgeDist = 1.0;
     if (u.sliceParams.y < 0.5) {
@@ -465,13 +608,12 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
     color = mix(color, vec3<f32>(0.32, 0.78, 0.98), rim * 0.85);
   }
 
-  let outRgb = select(srgbEncode(color), srgbEncode(acesFilmic(color)), xrayMode == 0);
-  return vec4<f32>(outRgb, 1.0);
+  return vec4<f32>(color, 1.0);
 }
 `;
 
 // ----------------------------------------------------------------------------
-// 2. 3D MYCELIAL NETWORK SHADER (WGSL)
+// 2. DEPTH-CUED 3D MYCELIAL NETWORK SHADER (WGSL HDR)
 // ----------------------------------------------------------------------------
 export const MYCELIUM_WGSL = /* wgsl */ `
 ${WGSL_COMMON}
@@ -505,7 +647,7 @@ fn vs_main(v: MycVertIn) -> MycVertOut {
   } else {
     side = side / sideLen;
   }
-  let visRadius = clamp(v.radiusTurgor.x * 4.8, 0.00075, 0.0032);
+  let visRadius = clamp(v.radiusTurgor.x * 4.6, 0.00072, 0.0030);
   let worldPos = p + side * (v.corner.y * visRadius);
   out.clipPos = u.viewProj * vec4<f32>(worldPos, 1.0);
   out.worldPos = worldPos;
@@ -523,40 +665,58 @@ fn fs_main(in: MycVertOut) -> @location(0) vec4<f32> {
   let cylShade = sqrt(max(0.0, 1.0 - in.across * in.across));
   let xrayMode = i32(floor(u.soilBoundsMax.w + 0.5));
 
+  // Distance inward from nearest exposed cutaway glass / surface / razor slice
+  let dX = min(in.worldPos.x - u.soilBoundsMin.x, u.soilBoundsMax.x - in.worldPos.x);
+  let dZ = min(in.worldPos.z - u.soilBoundsMin.z, u.soilBoundsMax.z - in.worldPos.z);
+  let dY = max(0.0, -in.worldPos.y);
+  var distFromExposed = min(min(dX, dZ), dY);
+  if (u.sliceParams.x > 0.5) {
+    let sDist = select(u.sliceParams.z - in.worldPos.x, u.sliceParams.z - in.worldPos.z, u.sliceParams.y > 0.5);
+    distFromExposed = min(distFromExposed, max(0.0, sDist));
+  }
+  let isSubterranean = u.sliceParams.w < 0.7;
+  let depthCue = select(1.0, exp(-max(0.0, distFromExposed) * 9.5) * 0.78 + 0.22, isSubterranean);
+
   var col: vec3<f32>;
   if (xrayMode == 3) {
-    col = colormapViridis(in.turgorNorm) * (0.65 + 0.55 * cylShade);
+    col = colormapViridis(in.turgorNorm) * (0.55 + 0.55 * cylShade);
   } else {
-    let dryHypha = vec3<f32>(0.42, 0.36, 0.28);
-    let turgidHypha = vec3<f32>(0.98, 0.93, 0.76);
-    let glowTip = vec3<f32>(1.0, 0.85, 0.45);
+    let dryHypha = srgbToLinear(vec3<f32>(0.42, 0.34, 0.24));
+    let turgidHypha = srgbToLinear(vec3<f32>(0.96, 0.90, 0.76));
+    let glowTip = srgbToLinear(vec3<f32>(1.02, 0.84, 0.42));
     col = mix(dryHypha, turgidHypha, in.turgorNorm);
-    col = mix(col, glowTip, pow(in.turgorNorm, 2.2) * 0.45);
-    col = col * (0.55 + 0.65 * cylShade);
+    col = mix(col, glowTip, pow(in.turgorNorm, 2.2) * 0.42);
+    col = col * (0.48 + 0.65 * cylShade);
+    if (isSubterranean) {
+      // Deep underground filaments shift smoothly toward warm amber earth tone
+      col = mix(col * vec3<f32>(0.58, 0.40, 0.24), col, depthCue);
+    }
   }
 
-  let alpha = smoothstep(0.0, 0.28, radial) * u.sliceParams.w;
+  let alpha = smoothstep(0.0, 0.28, radial) * u.sliceParams.w * mix(1.0, depthCue, 0.35);
   if (alpha < 0.02) {
     discard;
   }
-  return vec4<f32>(srgbEncode(col), alpha);
+  return vec4<f32>(col, alpha);
 }
 `;
 
 // ----------------------------------------------------------------------------
-// 3. WAXY CHITIN SSS + FAST-SDF-AO + 2-BOUNCE GI MUSHROOM SHADER (WGSL)
+// 3. BOTANICAL SPECIES PBR + WAXY CHITIN SSS + PCF SHADOW + FAST-SDF-AO/GI
 // ----------------------------------------------------------------------------
 export const MUSHROOM_WGSL = /* wgsl */ `
 ${WGSL_COMMON}
 
 @group(0) @binding(0) var<uniform> u: SceneUniforms;
 ${makeWgslSdfGiHelpers(1, 'sdfSamp', 3, 2)}
+${makeWgslShadowHelpers(4, 5)}
 
 struct MushVertIn {
   @location(0) pos: vec3<f32>,
   @location(1) normal: vec3<f32>,
   @location(2) color: vec3<f32>,
   @location(3) metrics: vec3<f32>, // x = stressVM (Pa), y = turgorPa (Pa), z = partId
+  @location(4) botUv: vec4<f32>,   // xy = cap-local (dx/capR, dz/capR), z = relY, w = bodySeed
 };
 
 struct MushVertOut {
@@ -565,6 +725,7 @@ struct MushVertOut {
   @location(1) worldNormal: vec3<f32>,
   @location(2) baseColor: vec3<f32>,
   @location(3) metrics: vec3<f32>,
+  @location(4) botUv: vec4<f32>,
 };
 
 @vertex
@@ -575,6 +736,7 @@ fn vs_main(v: MushVertIn) -> MushVertOut {
   out.worldNormal = v.normal;
   out.baseColor = v.color;
   out.metrics = v.metrics;
+  out.botUv = v.botUv;
   return out;
 }
 
@@ -602,75 +764,142 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
     let line = 1.0 - smoothstep(0.02, 0.06, contour);
     let ndl = max(dot(n, l), 0.0);
     col = col * (0.58 + 0.55 * ndl) + vec3<f32>(0.15) * line;
-    return vec4<f32>(srgbEncode(col), 1.0);
+    return vec4<f32>(col, 1.0);
   }
   if (xrayMode == 3) {
     let t = clamp(turgorPa / 7.5e5, 0.0, 1.0);
     var col = colormapViridis(t);
     let ndl = max(dot(n, l), 0.0);
     col = col * (0.55 + 0.55 * ndl);
-    return vec4<f32>(srgbEncode(col), 1.0);
+    return vec4<f32>(col, 1.0);
   }
 
-  // Organic micro-grain & subtle normal bump on chitin / gills
+  let rNorm = clamp(length(in.botUv.xy), 0.0, 1.35);
+  let theta = atan2(in.botUv.y, in.botUv.x);
+  let relY = in.botUv.z;
+  let bSeed = in.botUv.w;
+  let speciesIdx = i32(floor(u.speciesExtra.x + 0.5));
+
   let micro = valueNoise3D(in.worldPos * 260.0);
-  let microX = valueNoise3D((in.worldPos + vec3<f32>(0.0015, 0.0, 0.0)) * 260.0);
-  let microZ = valueNoise3D((in.worldPos + vec3<f32>(0.0, 0.0, 0.0015)) * 260.0);
-  let bumpAmt = select(0.18, 0.08, partId == 2);
-  let nLit = normalize(n - vec3<f32>(microX - micro, 0.0, microZ - micro) * bumpAmt);
+  let microX = valueNoise3D((in.worldPos + vec3<f32>(0.0014, 0.0, 0.0)) * 260.0);
+  let microZ = valueNoise3D((in.worldPos + vec3<f32>(0.0, 0.0, 0.0014)) * 260.0);
 
-  var albedo = in.baseColor * (0.93 + 0.14 * micro);
-  if (!frontFacing) {
-    albedo = mix(albedo, vec3<f32>(0.93, 0.90, 0.82), 0.65);
+  var albedo = srgbToLinear(in.baseColor) * (0.94 + 0.12 * micro);
+  var specPower = 36.0;
+  var specStrength = select(0.14, 0.04, partId == 2);
+  var sheenStrength = 0.0;
+  var sheenColor = vec3<f32>(1.0);
+  var bumpVec = vec3<f32>(microX - micro, 0.0, microZ - micro) * select(0.18, 0.08, partId == 2);
+
+  if (partId == 1) {
+    if (speciesIdx == 0) {
+      // Meadow Parasol: warm chestnut umbo + fractured concentric brown scales + fine margin striations
+      let umbo = smoothstep(0.30, 0.04, rNorm);
+      let scaleBand = sin(rNorm * 26.0 + valueNoise3D(in.worldPos * 95.0) * 3.8 + bSeed);
+      let patchBreak = smoothstep(-0.12, 0.52, sin(theta * 14.0 + valueNoise3D(in.worldPos * 85.0) * 6.4 + bSeed * 2.1));
+      let patchMask = smoothstep(0.14, 0.68, scaleBand) * patchBreak * smoothstep(0.16, 0.42, rNorm) * (1.0 - smoothstep(0.78, 1.04, rNorm));
+      let striation = sin(theta * 88.0 + valueNoise3D(in.worldPos * 120.0) * 1.4) * smoothstep(0.58, 0.96, rNorm);
+      let umboCol = srgbToLinear(vec3<f32>(0.38, 0.21, 0.10));
+      let scaleCol = srgbToLinear(vec3<f32>(0.50, 0.31, 0.18));
+      albedo = mix(albedo, umboCol, umbo * 0.84);
+      albedo = mix(albedo, scaleCol, patchMask * 0.68);
+      albedo *= 1.0 - 0.10 * abs(striation);
+      bumpVec += vec3<f32>(-sin(theta), 0.0, cos(theta)) * (striation * 0.16);
+      specPower = 64.0;
+      specStrength = 0.16;
+    } else if (speciesIdx == 1) {
+      // Golden Chanterelle: deep apricot center -> golden rim + velvety Charlie sheen
+      let centerApricot = srgbToLinear(vec3<f32>(0.84, 0.36, 0.04));
+      let rimGold = srgbToLinear(vec3<f32>(0.98, 0.72, 0.12));
+      albedo = mix(centerApricot, rimGold, smoothstep(0.08, 0.85, rNorm)) * (0.94 + 0.12 * micro);
+      sheenStrength = 0.18;
+      sheenColor = srgbToLinear(vec3<f32>(1.0, 0.82, 0.32));
+      specPower = 24.0;
+      specStrength = 0.06;
+    } else if (speciesIdx == 2) {
+      // Woodland Morel: sharp 3D Voronoi cellular honeycomb pits & ridges
+      let cellPos = in.worldPos * 165.0 + vec3<f32>(bSeed * 3.7, bSeed * 1.9, bSeed * 5.1);
+      let vor = voronoi3D(cellPos);
+      // F2 - F1 is small along Voronoi walls (ridges) and larger inside cells (deep alveoli!)
+      let ridge = 1.0 - smoothstep(0.03, 0.22, vor.y);
+      let pitCol = srgbToLinear(vec3<f32>(0.22, 0.14, 0.08));
+      let ridgeCol = srgbToLinear(vec3<f32>(0.76, 0.59, 0.39)) * (0.92 + 0.16 * micro);
+      albedo = mix(pitCol, ridgeCol, ridge);
+      specPower = 54.0;
+      specStrength = mix(0.03, 0.15, ridge);
+      bumpVec += vec3<f32>(microX - micro, (ridge - 0.5) * 0.12, microZ - micro) * 0.22;
+    } else {
+      // Shaggy Ink Cap: vertical fibrous scales + deliquescing black wet margin
+      let fiber = valueNoise3D(vec3<f32>(cos(theta) * 18.0, relY * 180.0, sin(theta) * 18.0) + vec3<f32>(bSeed));
+      let inkMargin = smoothstep(0.68, 0.98, rNorm);
+      let scaleCol = mix(albedo * 0.82, srgbToLinear(vec3<f32>(0.96, 0.94, 0.89)), smoothstep(0.42, 0.75, fiber));
+      albedo = mix(scaleCol, srgbToLinear(vec3<f32>(0.06, 0.06, 0.08)), inkMargin * 0.88);
+      specPower = mix(36.0, 96.0, inkMargin);
+      specStrength = mix(0.10, 0.30, inkMargin);
+    }
+  } else if (partId == 0) {
+    // Stipe vertical fibrous micro-striation
+    let stipeFib = valueNoise3D(vec3<f32>(in.worldPos.x * 180.0, relY * 45.0, in.worldPos.z * 180.0));
+    albedo *= 0.90 + 0.18 * stipeFib;
   }
 
-  // Structural gill/basal AO combined with Fast-SDF-AO + Bent Normal
+  if (!frontFacing) {
+    albedo = mix(albedo, srgbToLinear(vec3<f32>(0.90, 0.85, 0.76)), 0.60);
+  }
+
+  let nLit = normalize(n - bumpVec);
+
   var structAo = 1.0;
   if (partId == 2) {
-    structAo = mix(0.45, 0.94, clamp(0.5 + 0.5 * abs(nLit.x * 0.5 + nLit.z * 0.5), 0.0, 1.0));
-    structAo *= mix(0.66, 1.0, smoothstep(-0.85, 0.25, nLit.y));
+    structAo = mix(0.42, 0.94, clamp(0.5 + 0.5 * abs(nLit.x * 0.5 + nLit.z * 0.5), 0.0, 1.0));
+    structAo *= mix(0.62, 1.0, smoothstep(-0.85, 0.25, nLit.y));
   } else if (partId == 0) {
-    structAo = mix(0.76, 1.0, smoothstep(0.0, 0.025, in.worldPos.y));
+    structAo = mix(0.70, 1.0, smoothstep(0.0, 0.025, in.worldPos.y));
   }
 
   let sdfProbe = in.worldPos + nLit * 0.005;
   let aoBent = evalFastSdfAO(sdfProbe, nLit);
   let bentN = aoBent.xyz;
   let sdfAo = aoBent.w;
-  let totalAo = structAo * mix(0.45, 1.0, sdfAo);
+  let totalAo = structAo * mix(0.46, 1.0, sdfAo);
 
-  let shadow = evalSdfSoftShadow(in.worldPos + nLit * 0.008, l);
+  let pcfSh = evalPcfShadow(in.worldPos, nLit);
+  let sdfSh = evalSdfSoftShadow(in.worldPos + nLit * 0.008, l);
+  let shadow = min(pcfSh, mix(0.34, 1.0, sdfSh));
   let gi = evalSdfGI(sdfProbe, nLit, bentN);
 
-  // Wrap-diffuse sun attenuated by soft SDF shadow + bent-normal sky fill + 2-bounce GI
-  let wrapNdl = clamp((dot(nLit, l) + 0.30) / 1.30, 0.0, 1.0);
-  let sunTerm = vec3<f32>(1.12, 1.06, 0.96) * wrapNdl * mix(0.20, 1.0, shadow);
-  let skyFill = mix(vec3<f32>(0.055, 0.060, 0.072), vec3<f32>(0.18, 0.23, 0.30), bentN.y * 0.5 + 0.5);
+  // 3-Point Studio Macro Botanical Lighting: Sun Key + Bent-Normal Sky Fill + Warm Rim Backlight
+  let wrapNdl = clamp((dot(nLit, l) + 0.22) / 1.22, 0.0, 1.0);
+  let sunTerm = vec3<f32>(0.94, 0.88, 0.76) * wrapNdl * mix(0.20, 1.0, shadow);
+  let skyFill = mix(vec3<f32>(0.025, 0.030, 0.038), vec3<f32>(0.10, 0.13, 0.18), bentN.y * 0.5 + 0.5);
+
+  let fresnel = pow(1.0 - max(dot(nLit, v), 0.0), 3.0);
+  let rimBack = max(0.25, dot(-v, l) * 0.5 + 0.5);
+  let rimLight = vec3<f32>(0.85, 0.74, 0.60) * fresnel * rimBack * 0.14 * u.postParams.w * totalAo;
+  let sheen = sheenColor * pow(1.0 - max(dot(nLit, v), 0.0), 2.2) * sheenStrength * totalAo;
 
   // Backlit subsurface scattering (waxy chitin translucency)
-  let backLight = pow(clamp(dot(v, -l + nLit * 0.38), 0.0, 1.0), 2.5);
-  let thicknessFactor = select(0.55, 0.98, partId == 2 || partId == 3);
-  let sss = u.sssColor.rgb * backLight * 0.56 * thicknessFactor * (0.45 + 0.55 * shadow);
+  let backLight = pow(clamp(dot(v, -l + nLit * 0.36), 0.0, 1.0), 2.4);
+  let thicknessFactor = select(0.55, 1.00, partId == 2 || partId == 3);
+  let sss = srgbToLinear(u.sssColor.rgb) * backLight * 0.36 * thicknessFactor * (0.40 + 0.60 * shadow);
 
-  // Waxy chitin specular + Fresnel rim modulated by AO & shadow
-  let fresnel = pow(1.0 - max(dot(nLit, v), 0.0), 3.2);
-  let spec = pow(max(dot(nLit, h), 0.0), 32.0) * select(0.20, 0.07, partId == 2) * shadow * sdfAo;
-  let rim = vec3<f32>(0.85, 0.88, 0.94) * fresnel * 0.14 * totalAo;
+  let spec = pow(max(dot(nLit, h), 0.0), specPower) * specStrength * shadow * sdfAo;
 
-  let color = albedo * ((skyFill + sunTerm) * totalAo + gi * 0.72) + sss + vec3<f32>(spec) + rim;
+  let color = albedo * ((skyFill + sunTerm) * totalAo + gi * 0.48) + sss + sheen + vec3<f32>(spec) + rimLight;
   let alpha = select(1.0, 0.86, partId == 3);
-  return vec4<f32>(srgbEncode(acesFilmic(color)), alpha);
+  return vec4<f32>(color, alpha);
 }
 `;
 
 // ----------------------------------------------------------------------------
-// 4. SOLID OBSTACLES & GLASS TERRARIUM ARCHITECTURE SHADER (WGSL)
+// 4. SOLID OBSTACLES & PHYSICAL GLASS W/ CONDENSATION SHADER (WGSL HDR)
 // ----------------------------------------------------------------------------
 export const SOLID_WGSL = /* wgsl */ `
 ${WGSL_COMMON}
 
 @group(0) @binding(0) var<uniform> u: SceneUniforms;
 ${makeWgslSdfGiHelpers(1, 'sdfSamp', 3, 2)}
+${makeWgslShadowHelpers(4, 5)}
 
 struct SolidVertIn {
   @location(0) pos: vec3<f32>,
@@ -706,22 +935,33 @@ fn fs_main(in: SolidVertOut) -> @location(0) vec4<f32> {
   let l = normalize(u.lightDir.xyz);
   let v = normalize(u.cameraPos.xyz - in.worldPos);
 
+  // Translucent museum glass pane + live RH condensation + soil meniscus
   if (in.color.a < 0.95) {
+    let xrayMode = i32(floor(u.soilBoundsMax.w + 0.5));
     let fresnel = pow(1.0 - abs(dot(n, v)), 2.8);
-    let col = in.color.rgb + vec3<f32>(0.55, 0.72, 0.88) * fresnel * 0.42;
-    let alpha = clamp(in.color.a + fresnel * 0.14, 0.0, 0.45);
+    let rh = clamp(u.soilDims.w, 0.0, 1.0);
+    let rhMist = select(0.0, smoothstep(0.72, 0.98, rh), xrayMode == 0);
+    let hBand = smoothstep(0.02, 0.14, in.worldPos.y) * (1.0 - smoothstep(0.24, 0.34, in.worldPos.y));
+    let dropNoise = voronoi3D(in.worldPos * 280.0);
+    let droplet = (1.0 - smoothstep(0.08, 0.30, dropNoise.x)) * rhMist * hBand;
+    let meniscus = (1.0 - smoothstep(0.0, 0.008, abs(in.worldPos.y))) * select(0.03, 0.08, xrayMode == 0);
+
+    let col = srgbToLinear(in.color.rgb) + srgbToLinear(vec3<f32>(0.55, 0.72, 0.88)) * fresnel * 0.42 + vec3<f32>(0.42, 0.56, 0.72) * droplet * 0.18;
+    let baseA = select(in.color.a * 0.45, in.color.a, xrayMode == 0);
+    let alpha = clamp(baseA + fresnel * 0.13 + droplet * 0.055 + meniscus, 0.0, 0.42);
     return vec4<f32>(col, alpha);
   }
 
-  let grain = valueNoise3D(in.worldPos * 150.0);
+  let grain = fbm3D(in.worldPos * 140.0);
   let ndl = max(dot(n, l), 0.0);
   let aoBent = evalFastSdfAO(in.worldPos + n * 0.005, n);
-  let shadow = evalSdfSoftShadow(in.worldPos + n * 0.006, l);
+  let shadow = min(evalPcfShadow(in.worldPos, n), mix(0.35, 1.0, evalSdfSoftShadow(in.worldPos + n * 0.006, l)));
   let gi = evalSdfGI(in.worldPos + n * 0.006, n, aoBent.xyz);
 
-  let hemi = 0.22 + 0.18 * (aoBent.y * 0.5 + 0.5);
-  let col = in.color.rgb * (0.86 + 0.28 * grain) * ((hemi + 0.92 * ndl * mix(0.24, 1.0, shadow)) * aoBent.w + gi * 0.65);
-  return vec4<f32>(srgbEncode(acesFilmic(col)), 1.0);
+  let hemi = 0.08 + 0.08 * (aoBent.y * 0.5 + 0.5);
+  let albedo = srgbToLinear(in.color.rgb);
+  let col = albedo * (0.86 + 0.28 * grain) * ((hemi + 0.92 * ndl * mix(0.22, 1.0, shadow)) * aoBent.w + gi * 0.48);
+  return vec4<f32>(col, 1.0);
 }
 `;
 
@@ -1095,7 +1335,7 @@ void main() {
   vec3 side = cross(segDir, toCam);
   float sLen = length(side);
   side = sLen < 1e-4 ? vec3(1.0, 0.0, 0.0) : side / sLen;
-  float visRadius = clamp(aRadiusTurgor.x * 4.8, 0.00075, 0.0032);
+  float visRadius = clamp(aRadiusTurgor.x * 4.6, 0.00072, 0.0030);
   vec3 worldPos = p + side * (aCorner.y * visRadius);
   gl_Position = uViewProj * vec4(worldPos, 1.0);
   vWorldPos = worldPos;

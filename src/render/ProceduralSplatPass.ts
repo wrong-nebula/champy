@@ -15,6 +15,7 @@ import {
   type XRayFieldMode,
 } from '../types/contract.ts';
 import type { Mat4 } from './math.ts';
+import { evalSoilSurfaceHeightM } from './terrainHeight.ts';
 import { WGSL_COMMON, makeWgslSdfGiHelpers } from './shaders.ts';
 
 export const MAX_SPLATS = 65536;
@@ -261,7 +262,7 @@ fn cs_project_splats(@builtin(global_invocation_id) gid: vec3<u32>) {
   var outAlpha = s.posAlpha.w;
 
   if (kind == 0 || kind == 2) {
-    // Organic soil/moss/litter/cap-fuzz: Fast-SDF-AO + soft shadow + 2-bounce GI
+    // Organic soil/moss/litter/cap-fuzz: Fast-SDF-AO + soft shadow + 2-bounce GI (linear HDR)
     let nSurf = normalize(select(vec3<f32>(0.0, 1.0, 0.0), R[1], kind == 0) + select(vec3<f32>(0.0), R[0], kind == 2));
     let nProbe = normalize(mix(vec3<f32>(0.0, 1.0, 0.0), nSurf, 0.55));
     let probePos = pos + nProbe * 0.005;
@@ -269,24 +270,26 @@ fn cs_project_splats(@builtin(global_invocation_id) gid: vec3<u32>) {
     let shadow = evalSdfSoftShadow(probePos, l);
     let gi = evalSdfGI(probePos, nProbe, aoBent.xyz);
     let ndl = clamp((dot(nProbe, l) + 0.35) / 1.35, 0.0, 1.0);
-    let sky = mix(vec3<f32>(0.08, 0.09, 0.10), vec3<f32>(0.24, 0.29, 0.36), aoBent.y * 0.5 + 0.5);
-    let sun = vec3<f32>(1.08, 1.02, 0.92) * ndl * mix(0.22, 1.0, shadow);
-    let lit = s.colorMeta.rgb * ((sky + sun) * aoBent.w + gi * 0.68);
-    outCol = srgbEncode(acesFilmic(lit));
+    let sky = mix(vec3<f32>(0.030, 0.036, 0.042), vec3<f32>(0.10, 0.13, 0.18), aoBent.y * 0.5 + 0.5);
+    let sun = vec3<f32>(0.94, 0.88, 0.76) * ndl * mix(0.22, 1.0, shadow);
+    let baseLin = pow(max(s.colorMeta.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
+    let lit = baseLin * ((sky + sun) * aoBent.w + gi * 0.48);
+    outCol = lit;
   } else if (kind == 1) {
-    // Cottony mycelial halo
+    // Cottony mycelial halo (linear HDR)
     if (xrayMode == 3) {
-      outCol = srgbEncode(colormapViridis(s.colorMeta.w));
+      outCol = colormapViridis(s.colorMeta.w);
     } else {
-      outCol = srgbEncode(s.colorMeta.rgb);
+      outCol = pow(max(s.colorMeta.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)) * 0.85;
     }
   } else {
-    // Volumetric velocity-stretched Dressaire spore mist with Tyndall forward scatter
+    // Volumetric velocity-stretched Dressaire spore mist with Tyndall forward scatter (linear HDR)
     let forwardScatter = pow(clamp(dot(v, -l), 0.0, 1.0), 2.2) * 0.35 + 0.65;
     let lifted = clamp(s.colorMeta.w / 0.03, 0.0, 1.0);
-    let baseMist = mix(max(u.sporePrintColor.rgb * 1.45, vec3<f32>(0.58, 0.54, 0.48)), vec3<f32>(0.42, 0.86, 0.98), lifted * 0.78);
-    let tint = mix(baseMist, vec3<f32>(1.0, 0.96, 0.88), 0.25 * forwardScatter);
-    outCol = tint * (0.78 + 0.22 * forwardScatter);
+    let sporeLin = pow(max(u.sporePrintColor.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
+    let baseMist = mix(max(sporeLin * 1.4, vec3<f32>(0.26, 0.22, 0.18)), vec3<f32>(0.18, 0.56, 0.86), lifted * 0.78);
+    let tint = mix(baseMist, vec3<f32>(0.88, 0.82, 0.72), 0.22 * forwardScatter);
+    outCol = tint * (0.68 + 0.22 * forwardScatter);
   }
 
   // Quantize back-to-front 16-bit depth key in [0, 65534] so ascending sort orders far->near
@@ -693,7 +696,7 @@ export class ProceduralSplatPass {
     for (let i = 0; i < total; i += stride) {
       sigNum = (sigNum * 31 + soil.material[i] * 17 + Math.round(soil.theta[i] * 25)) | 0;
     }
-    const sig = `${sigNum}:${snapshot.species.id}`;
+    const sig = `${sigNum}:${snapshot.species.id}:${snapshot.bodies.length}`;
     if (sig === this.lastSoilSig && this.soilSplatCount > 0) {
       return;
     }
@@ -720,7 +723,9 @@ export class ProceduralSplatPass {
           const seed = idx * 13 + k * 37;
           const jx = (hash1(seed + 1) - 0.5) * dx * 0.96;
           const jz = (hash1(seed + 2) - 0.5) * dx * 0.96;
-          const jy = 0.0006 + hash1(seed + 3) * 0.0034;
+          const px = cx + jx;
+          const pz = cz + jz;
+          const jy = evalSoilSurfaceHeightM(px, pz, soil, snapshot.bodies) + 0.0004 + hash1(seed + 3) * 0.0026;
           const yaw = hash1(seed + 4) * Math.PI * 2;
           const tX = (hash1(seed + 5) - 0.5) * 0.48;
           const tZ = (hash1(seed + 6) - 0.5) * 0.48;
@@ -733,73 +738,73 @@ export class ProceduralSplatPass {
             const mossRoll = hash1(seed + 8);
             if (mossRoll > 0.40) {
               // Crisp velvety 3D moss tuft
-              r = 0.075 + varTone * 0.35;
-              g = 0.21 + varTone * 0.75;
-              b = 0.055 + varTone * 0.20;
+              r = 0.20 + varTone * 0.4;
+              g = 0.40 + varTone * 0.7;
+              b = 0.13 + varTone * 0.25;
               sx = 0.0024 + hash1(seed + 9) * 0.0015;
-              sy = 0.0016 + hash1(seed + 10) * 0.0012;
+              sy = 0.0014 + hash1(seed + 10) * 0.0010;
               sz = sx * 0.86;
-              alpha = 0.78;
+              alpha = 0.76;
             } else if (mossRoll > 0.16) {
               // Fallen decaying forest leaf-litter flake
-              r = 0.24 + varTone * 0.5;
-              g = 0.13 + varTone * 0.3;
-              b = 0.062;
+              r = 0.44 + varTone * 0.5;
+              g = 0.24 + varTone * 0.3;
+              b = 0.10;
               sx = 0.0042;
               sy = 0.0008;
               sz = 0.0020;
-              alpha = 0.80;
+              alpha = 0.78;
             } else {
-              // Dark rich humus crumb
-              r = 0.10 + varTone * 0.28;
-              g = 0.07 + varTone * 0.18;
-              b = 0.048;
+              // Rich dark humus crumb
+              r = 0.22 + varTone * 0.3;
+              g = 0.15 + varTone * 0.2;
+              b = 0.10;
               sx = 0.0026;
               sy = 0.0013;
               sz = 0.0023;
-              alpha = 0.78;
+              alpha = 0.76;
             }
           } else if (mat === SoilMaterialId.WOOD) {
             // Fibrous decaying oak bark splinter
-            r = 0.27 + varTone * 0.5;
-            g = 0.15 + varTone * 0.3;
-            b = 0.075;
+            r = 0.38 + varTone * 0.5;
+            g = 0.22 + varTone * 0.3;
+            b = 0.11;
             sx = 0.0046;
             sy = 0.0010;
             sz = 0.0015;
-            alpha = 0.78;
+            alpha = 0.76;
           } else if (mat === SoilMaterialId.SAND) {
-            r = 0.54 + varTone * 0.5;
-            g = 0.45 + varTone * 0.4;
-            b = 0.31 + varTone * 0.3;
+            r = 0.62 + varTone * 0.4;
+            g = 0.53 + varTone * 0.35;
+            b = 0.38 + varTone * 0.3;
             sx = 0.0021;
             sy = 0.0009;
             sz = 0.0019;
             alpha = 0.72;
           } else if (mat === SoilMaterialId.STONE) {
             // Mossy granite fleck on exposed surface stone
-            r = 0.15 + varTone * 0.3;
-            g = 0.23 + varTone * 0.4;
-            b = 0.13 + varTone * 0.2;
+            r = 0.24 + varTone * 0.3;
+            g = 0.38 + varTone * 0.4;
+            b = 0.18 + varTone * 0.2;
             sx = 0.0026;
             sy = 0.0010;
             sz = 0.0022;
             alpha = 0.72;
           } else {
             // Loam / Clay surface crumbs
-            r = (mat === SoilMaterialId.CLAY ? 0.32 : 0.22) + varTone * 0.4;
-            g = (mat === SoilMaterialId.CLAY ? 0.20 : 0.15) + varTone * 0.3;
-            b = (mat === SoilMaterialId.CLAY ? 0.15 : 0.095) + varTone * 0.2;
+            r = (mat === SoilMaterialId.CLAY ? 0.42 : 0.34) + varTone * 0.4;
+            g = (mat === SoilMaterialId.CLAY ? 0.28 : 0.24) + varTone * 0.3;
+            b = (mat === SoilMaterialId.CLAY ? 0.21 : 0.16) + varTone * 0.2;
             sx = 0.0027;
             sy = 0.0011;
             sz = 0.0023;
             alpha = 0.72;
           }
 
-          const dark = 1.0 - wet * 0.52;
+          const dark = 1.0 - wet * 0.32;
           const qOff = this.pushSplat(
             count++,
-            cx + jx, jy, cz + jz, alpha,
+            px, jy, pz, alpha,
             sx, sy, sz, 0,
             r * dark, g * dark, b * dark, wet,
           );
@@ -962,8 +967,8 @@ export class ProceduralSplatPass {
         // Crisp glowing spore nucleus splat
         const qOffCore = this.pushSplat(
           count++,
-          px, py, pz, 0.74,
-          0.00105, 0.00105, 0.00105, 3,
+          px, py, pz, 0.58,
+          0.00095, 0.00095, 0.00095, 3,
           1, 1, 1, liftM,
         );
         d[qOffCore] = 0; d[qOffCore + 1] = 0; d[qOffCore + 2] = 0; d[qOffCore + 3] = 1;

@@ -7,6 +7,8 @@
 
 import {
   AMBIENT_O2_MOL_M3,
+  FruitingBodyState,
+  ISoilGrid,
   PickResult,
   SimulationSnapshot,
   SoilMaterialId,
@@ -30,6 +32,7 @@ import {
   vec3Normalize,
 } from './math.ts';
 import {
+  BACKDROP_WGSL,
   MUSHROOM_GLSL_FS,
   MUSHROOM_GLSL_VS,
   MUSHROOM_WGSL,
@@ -50,6 +53,10 @@ import {
 } from './shaders.ts';
 import { FastSdfGiSystem, SDF_NX, type SdfVolumeBounds } from './FastSdfGi.ts';
 import { ProceduralSplatPass } from './ProceduralSplatPass.ts';
+import { evalSoilSurfaceHeightM, evalSoilSurfaceNormal } from './terrainHeight.ts';
+import { ShadowMapPass } from './ShadowMapPass.ts';
+import { BotanicalScatterPass } from './BotanicalScatterPass.ts';
+import { PostProcessPass } from './PostProcessPass.ts';
 
 export type RendererBackend = 'webgpu' | 'webgl2';
 
@@ -152,26 +159,119 @@ function appendQuad(
   return o;
 }
 
+const TERRAIN_GRID_N = 36;
+const TERRAIN_CORNERS = TERRAIN_GRID_N + 1;
+const terrainYGrid = new Float32Array(TERRAIN_CORNERS * TERRAIN_CORNERS);
+const terrainNGrid = new Float32Array(TERRAIN_CORNERS * TERRAIN_CORNERS * 3);
+
+function appendSoilTri(
+  buf: Float32Array,
+  o: number,
+  ax: number, ay: number, az: number, nax: number, nay: number, naz: number,
+  bx: number, by: number, bz: number, nbx: number, nby: number, nbz: number,
+  cx: number, cy: number, cz: number, ncx: number, ncy: number, ncz: number,
+  flag: number,
+): number {
+  buf[o++] = ax; buf[o++] = ay; buf[o++] = az; buf[o++] = nax; buf[o++] = nay; buf[o++] = naz; buf[o++] = flag;
+  buf[o++] = bx; buf[o++] = by; buf[o++] = bz; buf[o++] = nbx; buf[o++] = nby; buf[o++] = nbz; buf[o++] = flag;
+  buf[o++] = cx; buf[o++] = cy; buf[o++] = cz; buf[o++] = ncx; buf[o++] = ncy; buf[o++] = ncz; buf[o++] = flag;
+  return o;
+}
+
 function buildSoilAndSliceMesh(
   out: Float32Array,
   b: SoilBounds,
   view: ViewState,
+  soil: ISoilGrid,
+  bodies: readonly FruitingBodyState[],
 ): number {
   let o = 0;
-  const { minX, maxX, minY, maxY, minZ, maxZ } = b;
-  // 6 faces of soil block (flag = 0)
-  // Top (+Y)
-  o = appendQuad(out, o, [minX, maxY, maxZ], [maxX, maxY, maxZ], [maxX, maxY, minZ], [minX, maxY, minZ], [0, 1, 0], 0);
+  const { minX, maxX, minY, minZ, maxZ } = b;
+  const spanX = maxX - minX;
+  const spanZ = maxZ - minZ;
+  const N = TERRAIN_GRID_N;
+  const C = TERRAIN_CORNERS;
+
+  // Sample displaced forest-floor heightfield & smooth normals across 37x37 grid corners
+  for (let iz = 0; iz <= N; iz++) {
+    const z = minZ + (iz / N) * spanZ;
+    for (let ix = 0; ix <= N; ix++) {
+      const x = minX + (ix / N) * spanX;
+      const idx = iz * C + ix;
+      terrainYGrid[idx] = evalSoilSurfaceHeightM(x, z, soil, bodies);
+      const nrm = evalSoilSurfaceNormal(x, z, soil, bodies);
+      const i3 = idx * 3;
+      terrainNGrid[i3] = nrm[0];
+      terrainNGrid[i3 + 1] = nrm[1];
+      terrainNGrid[i3 + 2] = nrm[2];
+    }
+  }
+
+  // Top (+Y) heightfield quads (CCW viewed from +Y)
+  for (let iz = 0; iz < N; iz++) {
+    const z0 = minZ + (iz / N) * spanZ;
+    const z1 = minZ + ((iz + 1) / N) * spanZ;
+    for (let ix = 0; ix < N; ix++) {
+      const x0 = minX + (ix / N) * spanX;
+      const x1 = minX + ((ix + 1) / N) * spanX;
+
+      const ia = (iz + 1) * C + ix;
+      const ib = (iz + 1) * C + (ix + 1);
+      const ic = iz * C + (ix + 1);
+      const id = iz * C + ix;
+
+      const ya = terrainYGrid[ia], yb = terrainYGrid[ib], yc = terrainYGrid[ic], yd = terrainYGrid[id];
+      const ia3 = ia * 3, ib3 = ib * 3, ic3 = ic * 3, id3 = id * 3;
+
+      o = appendSoilTri(
+        out, o,
+        x0, ya, z1, terrainNGrid[ia3], terrainNGrid[ia3 + 1], terrainNGrid[ia3 + 2],
+        x1, yb, z1, terrainNGrid[ib3], terrainNGrid[ib3 + 1], terrainNGrid[ib3 + 2],
+        x1, yc, z0, terrainNGrid[ic3], terrainNGrid[ic3 + 1], terrainNGrid[ic3 + 2],
+        0,
+      );
+      o = appendSoilTri(
+        out, o,
+        x0, ya, z1, terrainNGrid[ia3], terrainNGrid[ia3 + 1], terrainNGrid[ia3 + 2],
+        x1, yc, z0, terrainNGrid[ic3], terrainNGrid[ic3 + 1], terrainNGrid[ic3 + 2],
+        x0, yd, z0, terrainNGrid[id3], terrainNGrid[id3 + 1], terrainNGrid[id3 + 2],
+        0,
+      );
+    }
+  }
+
   // Bottom (-Y)
   o = appendQuad(out, o, [minX, minY, minZ], [maxX, minY, minZ], [maxX, minY, maxZ], [minX, minY, maxZ], [0, -1, 0], 0);
-  // Front (+Z)
-  o = appendQuad(out, o, [minX, minY, maxZ], [maxX, minY, maxZ], [maxX, maxY, maxZ], [minX, maxY, maxZ], [0, 0, 1], 0);
-  // Back (-Z)
-  o = appendQuad(out, o, [maxX, minY, minZ], [minX, minY, minZ], [minX, maxY, minZ], [maxX, maxY, minZ], [0, 0, -1], 0);
-  // Right (+X)
-  o = appendQuad(out, o, [maxX, minY, maxZ], [maxX, minY, minZ], [maxX, maxY, minZ], [maxX, maxY, maxZ], [1, 0, 0], 0);
-  // Left (-X)
-  o = appendQuad(out, o, [minX, minY, minZ], [minX, minY, maxZ], [minX, maxY, maxZ], [minX, maxY, minZ], [-1, 0, 0], 0);
+
+  // Contoured outer cutaway walls matching displaced terrain edge
+  for (let ix = 0; ix < N; ix++) {
+    const x0 = minX + (ix / N) * spanX;
+    const x1 = minX + ((ix + 1) / N) * spanX;
+    const y0 = terrainYGrid[N * C + ix];
+    const y1 = terrainYGrid[N * C + ix + 1];
+    o = appendQuad(out, o, [x0, minY, maxZ], [x1, minY, maxZ], [x1, y1, maxZ], [x0, y0, maxZ], [0, 0, 1], 0);
+  }
+  for (let ix = 0; ix < N; ix++) {
+    const x0 = minX + (ix / N) * spanX;
+    const x1 = minX + ((ix + 1) / N) * spanX;
+    const y0 = terrainYGrid[ix];
+    const y1 = terrainYGrid[ix + 1];
+    o = appendQuad(out, o, [x1, minY, minZ], [x0, minY, minZ], [x0, y0, minZ], [x1, y1, minZ], [0, 0, -1], 0);
+  }
+  for (let iz = 0; iz < N; iz++) {
+    const z0 = minZ + (iz / N) * spanZ;
+    const z1 = minZ + ((iz + 1) / N) * spanZ;
+    const y0 = terrainYGrid[iz * C + N];
+    const y1 = terrainYGrid[(iz + 1) * C + N];
+    o = appendQuad(out, o, [maxX, minY, z1], [maxX, minY, z0], [maxX, y0, z0], [maxX, y1, z1], [1, 0, 0], 0);
+  }
+  for (let iz = 0; iz < N; iz++) {
+    const z0 = minZ + (iz / N) * spanZ;
+    const z1 = minZ + ((iz + 1) / N) * spanZ;
+    const y0 = terrainYGrid[iz * C];
+    const y1 = terrainYGrid[(iz + 1) * C];
+    o = appendQuad(out, o, [minX, minY, z0], [minX, minY, z1], [minX, y1, z1], [minX, y0, z0], [-1, 0, 0], 0);
+  }
 
   // Obsidian laboratory plinth underneath soil (flag = 2)
   const pad = 0.012;
@@ -187,16 +287,224 @@ function buildSoilAndSliceMesh(
   o = appendQuad(out, o, [px1, py0, pz1], [px1, py0, pz0], [px1, py1, pz0], [px1, py1, pz1], [1, 0, 0], 2);
   o = appendQuad(out, o, [px0, py0, pz0], [px0, py0, pz1], [px0, py1, pz1], [px0, py1, pz0], [-1, 0, 0], 2);
 
-  // Dynamic Razor Slice cross-section face (flag = 1; single quad prevents coplanar Z-fighting)
+  // Dynamic Razor Slice cross-section face contoured to terrain (flag = 1; single strip prevents Z-fighting)
   if (view.sliceEnabled) {
     const sc = computeSliceWorldCoord(b, view);
     if (view.sliceAxis === 'x') {
-      o = appendQuad(out, o, [sc, minY, maxZ], [sc, minY, minZ], [sc, maxY, minZ], [sc, maxY, maxZ], [1, 0, 0], 1);
+      for (let iz = 0; iz < N; iz++) {
+        const z0 = minZ + (iz / N) * spanZ;
+        const z1 = minZ + ((iz + 1) / N) * spanZ;
+        const y0 = evalSoilSurfaceHeightM(sc, z0, soil, bodies);
+        const y1 = evalSoilSurfaceHeightM(sc, z1, soil, bodies);
+        o = appendQuad(out, o, [sc, minY, z1], [sc, minY, z0], [sc, y0, z0], [sc, y1, z1], [1, 0, 0], 1);
+      }
     } else {
-      o = appendQuad(out, o, [minX, minY, sc], [maxX, minY, sc], [maxX, maxY, sc], [minX, maxY, sc], [0, 0, 1], 1);
+      for (let ix = 0; ix < N; ix++) {
+        const x0 = minX + (ix / N) * spanX;
+        const x1 = minX + ((ix + 1) / N) * spanX;
+        const y0 = evalSoilSurfaceHeightM(x0, sc, soil, bodies);
+        const y1 = evalSoilSurfaceHeightM(x1, sc, soil, bodies);
+        o = appendQuad(out, o, [x0, minY, sc], [x1, minY, sc], [x1, y1, sc], [x0, y0, sc], [0, 0, 1], 1);
+      }
     }
   }
   return o / 7;
+}
+
+const SUBDIV_EDGE_HASH_SIZE = 65536;
+const subdivHashKeyLo = new Int32Array(SUBDIV_EDGE_HASH_SIZE);
+const subdivHashKeyHi = new Int32Array(SUBDIV_EDGE_HASH_SIZE);
+const subdivHashVal = new Int32Array(SUBDIV_EDGE_HASH_SIZE);
+
+interface MushSubdivState {
+  verts: Float32Array;
+  indices: Uint32Array;
+  vertCount: number;
+  indexCount: number;
+}
+
+/**
+ * Packs mushroom geometry into 64-byte (16-float) WebGPU vertices with botanical
+ * coordinates (dxNorm, dzNorm, relY, bodySeed) and applies 1-level PN-curved
+ * midpoint subdivision when triangle count <= 10,000.
+ */
+function packSubdividedMushroomMesh(
+  mesh: SimulationSnapshot['fruitingMesh'],
+  bodies: readonly FruitingBodyState[],
+  state: MushSubdivState,
+): void {
+  const origV = mesh.vertexCount;
+  const origI = mesh.indexCount;
+  if (origV <= 0 || origI <= 0) {
+    state.vertCount = 0;
+    state.indexCount = 0;
+    return;
+  }
+
+  const triCount = Math.floor(origI / 3);
+  const doSubdiv = triCount > 0 && triCount <= 10000 && origV < 32768;
+  const maxVertsNeeded = doSubdiv ? origV + triCount * 3 : origV;
+  const maxIdxNeeded = doSubdiv ? triCount * 12 : origI;
+
+  if (state.verts.length < maxVertsNeeded * 16) {
+    state.verts = new Float32Array(Math.max(maxVertsNeeded * 16, state.verts.length * 2));
+  }
+  if (state.indices.length < maxIdxNeeded) {
+    state.indices = new Uint32Array(Math.max(maxIdxNeeded, state.indices.length * 2));
+  }
+
+  const dst = state.verts;
+  const outIndices = state.indices;
+  const pos = mesh.positions;
+  const nrm = mesh.normals;
+  const col = mesh.colors;
+  const str = mesh.stressVM;
+  const tur = mesh.turgorPa;
+  const pid = mesh.partIds;
+  const bodyCount = bodies.length;
+
+  for (let i = 0; i < origV; i++) {
+    const i3 = i * 3;
+    const o = i * 16;
+    const px = pos[i3];
+    const py = pos[i3 + 1];
+    const pz = pos[i3 + 2];
+    const partId = pid[i];
+
+    dst[o] = px;
+    dst[o + 1] = py;
+    dst[o + 2] = pz;
+    dst[o + 3] = nrm[i3];
+    dst[o + 4] = nrm[i3 + 1];
+    dst[o + 5] = nrm[i3 + 2];
+    dst[o + 6] = col[i3];
+    dst[o + 7] = col[i3 + 1];
+    dst[o + 8] = col[i3 + 2];
+    dst[o + 9] = str[i];
+    dst[o + 10] = tur[i];
+    dst[o + 11] = partId;
+
+    if (bodyCount > 0) {
+      let best = bodies[0];
+      if (bodyCount > 1) {
+        let bestD2 = Infinity;
+        for (let bi = 0; bi < bodyCount; bi++) {
+          const b = bodies[bi];
+          const rx = partId < 0.5 ? 0.5 * (b.baseX + b.stipeTipX) : b.stipeTipX;
+          const ry = partId < 0.5 ? 0.5 * (b.baseY + b.stipeTipY) : b.stipeTipY;
+          const rz = partId < 0.5 ? 0.5 * (b.baseZ + b.stipeTipZ) : b.stipeTipZ;
+          const d2 = (px - rx) * (px - rx) + (py - ry) * (py - ry) + (pz - rz) * (pz - rz);
+          if (d2 < bestD2) {
+            bestD2 = d2;
+            best = b;
+          }
+        }
+      }
+      const capR = Math.max(best.capRadiusM, 0.012);
+      dst[o + 12] = (px - best.stipeTipX) / capR;
+      dst[o + 13] = (pz - best.stipeTipZ) / capR;
+      dst[o + 14] = (py - best.baseY) / Math.max(best.stipeLengthM + 0.015, 0.02);
+      dst[o + 15] = (best.id * 1.6180339) % 6.2831853;
+    } else {
+      dst[o + 12] = 0;
+      dst[o + 13] = 0;
+      dst[o + 14] = 0.5;
+      dst[o + 15] = 0;
+    }
+  }
+
+  if (!doSubdiv) {
+    outIndices.set(mesh.indices.subarray(0, origI));
+    state.vertCount = origV;
+    state.indexCount = origI;
+    return;
+  }
+
+  subdivHashKeyLo.fill(-1);
+  let nextVert = origV;
+  let outIdx = 0;
+  const srcIdx = mesh.indices;
+
+  const getOrMakeMid = (a: number, b: number): number => {
+    const lo = a < b ? a : b;
+    const hi = a < b ? b : a;
+    let slot = ((lo * 73856093) ^ (hi * 19349663)) & (SUBDIV_EDGE_HASH_SIZE - 1);
+    for (let p = 0; p < 64; p++) {
+      const kLo = subdivHashKeyLo[slot];
+      if (kLo === -1) {
+        const mid = nextVert++;
+        const ao = a * 16;
+        const bo = b * 16;
+        const mo = mid * 16;
+
+        const ax = dst[ao], ay = dst[ao + 1], az = dst[ao + 2];
+        const bx = dst[bo], by = dst[bo + 1], bz = dst[bo + 2];
+        const nax = dst[ao + 3], nay = dst[ao + 4], naz = dst[ao + 5];
+        const nbx = dst[bo + 3], nby = dst[bo + 4], nbz = dst[bo + 5];
+
+        const nd = Math.max(-1, Math.min(1, nax * nbx + nay * nby + naz * nbz));
+        const crispEdge = dst[ao + 11] >= 1.5 || dst[bo + 11] >= 1.5;
+        const smoothK = Math.max(0, Math.min(1, (nd - 0.30) / 0.70)) * (crispEdge ? 0.12 : 1.0);
+        const dax = ax - bx, day = ay - by, daz = az - bz;
+        const wA = dax * nax + day * nay + daz * naz;
+        const wB = -dax * nbx - day * nby - daz * nbz;
+        const pn = 0.125 * smoothK;
+
+        dst[mo] = 0.5 * (ax + bx) + pn * (wA * nax + wB * nbx);
+        dst[mo + 1] = 0.5 * (ay + by) + pn * (wA * nay + wB * nby);
+        dst[mo + 2] = 0.5 * (az + bz) + pn * (wA * naz + wB * nbz);
+
+        const mnx = nax + nbx;
+        const mny = nay + nby;
+        const mnz = naz + nbz;
+        const mnLen = Math.hypot(mnx, mny, mnz);
+        if (mnLen > 1e-6) {
+          const inv = 1 / mnLen;
+          dst[mo + 3] = mnx * inv;
+          dst[mo + 4] = mny * inv;
+          dst[mo + 5] = mnz * inv;
+        } else {
+          dst[mo + 3] = 0;
+          dst[mo + 4] = 1;
+          dst[mo + 5] = 0;
+        }
+
+        for (let k = 6; k < 16; k++) {
+          dst[mo + k] = 0.5 * (dst[ao + k] + dst[bo + k]);
+        }
+
+        subdivHashKeyLo[slot] = lo;
+        subdivHashKeyHi[slot] = hi;
+        subdivHashVal[slot] = mid;
+        return mid;
+      }
+      if (kLo === lo && subdivHashKeyHi[slot] === hi) {
+        return subdivHashVal[slot];
+      }
+      slot = (slot + 1) & (SUBDIV_EDGE_HASH_SIZE - 1);
+    }
+    return lo;
+  };
+
+  for (let t = 0; t < triCount; t++) {
+    const t3 = t * 3;
+    const i0 = srcIdx[t3];
+    const i1 = srcIdx[t3 + 1];
+    const i2 = srcIdx[t3 + 2];
+    if (i0 >= origV || i1 >= origV || i2 >= origV) continue;
+
+    const m01 = getOrMakeMid(i0, i1);
+    const m12 = getOrMakeMid(i1, i2);
+    const m20 = getOrMakeMid(i2, i0);
+
+    outIndices[outIdx++] = i0; outIndices[outIdx++] = m01; outIndices[outIdx++] = m20;
+    outIndices[outIdx++] = m01; outIndices[outIdx++] = i1; outIndices[outIdx++] = m12;
+    outIndices[outIdx++] = m20; outIndices[outIdx++] = m12; outIndices[outIdx++] = i2;
+    outIndices[outIdx++] = m01; outIndices[outIdx++] = m12; outIndices[outIdx++] = m20;
+  }
+
+  state.vertCount = nextVert;
+  state.indexCount = outIdx;
 }
 
 function appendSolidTri(
@@ -591,8 +899,8 @@ class WebGPUBackend {
   readonly device: GPUDevice;
   readonly context: GPUCanvasContext;
   readonly format: GPUTextureFormat;
-  private msaaColorTex: GPUTexture | null = null;
   private depthTex: GPUTexture | null = null;
+  private depthTexView: GPUTextureView | null = null;
   private width = 1;
   private height = 1;
 
@@ -601,6 +909,9 @@ class WebGPUBackend {
   private linearSampler: GPUSampler;
   private sdfGi: FastSdfGiSystem;
   private splatPass: ProceduralSplatPass;
+  private shadowPass: ShadowMapPass;
+  private botanicalPass: BotanicalScatterPass;
+  private postPass: PostProcessPass;
   private lastGiSig = '';
   private giTick = 0;
 
@@ -617,6 +928,7 @@ class WebGPUBackend {
   private simpleBindGroup: GPUBindGroup;
   private occBindGroup: GPUBindGroup;
 
+  private backdropPipe: GPURenderPipeline;
   private soilPipe: GPURenderPipeline;
   private mycPipe: GPURenderPipeline;
   private mycOccPipe: GPURenderPipeline;
@@ -646,11 +958,11 @@ class WebGPUBackend {
     this.format = format;
 
     this.uniformBuf = device.createBuffer({
-      size: 256,
+      size: 384,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.uniformBufOcc = device.createBuffer({
-      size: 256,
+      size: 384,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -662,37 +974,10 @@ class WebGPUBackend {
       addressModeW: 'clamp-to-edge',
     });
 
+    this.postPass = new PostProcessPass(device, format);
+    const hdrFormat = this.postPass.hdrFormat;
+
     this.sdfGi = new FastSdfGiSystem(device);
-
-    this.soilBindGroupLayout = device.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
-        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
-        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
-      ],
-    });
-
-    this.litBindGroupLayout = device.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
-      ],
-    });
-
-    this.litBindGroup = device.createBindGroup({
-      layout: this.litBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.uniformBuf } },
-        { binding: 1, resource: this.sdfGi.sdfView },
-        { binding: 2, resource: this.linearSampler },
-        { binding: 3, resource: this.sdfGi.radViewB },
-      ],
-    });
 
     this.simpleBindGroupLayout = device.createBindGroupLayout({
       entries: [
@@ -709,10 +994,58 @@ class WebGPUBackend {
       entries: [{ binding: 0, resource: { buffer: this.uniformBufOcc } }],
     });
 
+    this.shadowPass = new ShadowMapPass(device, this.simpleBindGroupLayout);
+
+    this.soilBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+      ],
+    });
+
+    this.litBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+      ],
+    });
+
+    this.litBindGroup = device.createBindGroup({
+      layout: this.litBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuf } },
+        { binding: 1, resource: this.sdfGi.sdfView },
+        { binding: 2, resource: this.linearSampler },
+        { binding: 3, resource: this.sdfGi.radViewB },
+        { binding: 4, resource: this.shadowPass.shadowView },
+        { binding: 5, resource: this.shadowPass.shadowSampler },
+      ],
+    });
+
     const alphaBlend: GPUBlendState = {
       color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
       alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
     };
+
+    const backMod = device.createShaderModule({ code: BACKDROP_WGSL });
+    this.backdropPipe = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [] }),
+      vertex: { module: backMod, entryPoint: 'vs_main' },
+      fragment: { module: backMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat }] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' },
+      multisample: { count: 4 },
+    });
 
     const soilMod = device.createShaderModule({ code: SOIL_WGSL });
     this.soilPipe = device.createRenderPipeline({
@@ -729,7 +1062,7 @@ class WebGPUBackend {
           ],
         }],
       },
-      fragment: { module: soilMod, entryPoint: 'fs_main', targets: [{ format }] },
+      fragment: { module: soilMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
       multisample: { count: 4 },
@@ -758,7 +1091,7 @@ class WebGPUBackend {
     this.mycPipe = device.createRenderPipeline({
       layout: simpleLayout,
       vertex: { module: mycMod, entryPoint: 'vs_main', buffers: mycVertBuffers },
-      fragment: { module: mycMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
+      fragment: { module: mycMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less-equal' },
       multisample: { count: 4 },
@@ -766,7 +1099,7 @@ class WebGPUBackend {
     this.mycOccPipe = device.createRenderPipeline({
       layout: simpleLayout,
       vertex: { module: mycMod, entryPoint: 'vs_main', buffers: mycVertBuffers },
-      fragment: { module: mycMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
+      fragment: { module: mycMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'greater' },
       multisample: { count: 4 },
@@ -779,16 +1112,17 @@ class WebGPUBackend {
         module: mushMod,
         entryPoint: 'vs_main',
         buffers: [{
-          arrayStride: 48,
+          arrayStride: 64,
           attributes: [
             { shaderLocation: 0, offset: 0, format: 'float32x3' },
             { shaderLocation: 1, offset: 12, format: 'float32x3' },
             { shaderLocation: 2, offset: 24, format: 'float32x3' },
             { shaderLocation: 3, offset: 36, format: 'float32x3' },
+            { shaderLocation: 4, offset: 48, format: 'float32x4' },
           ],
         }],
       },
-      fragment: { module: mushMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
+      fragment: { module: mushMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
       multisample: { count: 4 },
@@ -806,7 +1140,7 @@ class WebGPUBackend {
     this.solidPipe = device.createRenderPipeline({
       layout: litLayout,
       vertex: { module: solidMod, entryPoint: 'vs_main', buffers: solidBuffers },
-      fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format }] },
+      fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
       multisample: { count: 4 },
@@ -814,7 +1148,7 @@ class WebGPUBackend {
     this.glassPipe = device.createRenderPipeline({
       layout: litLayout,
       vertex: { module: solidMod, entryPoint: 'vs_main', buffers: solidBuffers },
-      fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
+      fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
       multisample: { count: 4 },
@@ -822,7 +1156,7 @@ class WebGPUBackend {
     this.linePipe = device.createRenderPipeline({
       layout: litLayout,
       vertex: { module: solidMod, entryPoint: 'vs_main', buffers: solidBuffers },
-      fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
+      fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'line-list' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less-equal' },
       multisample: { count: 4 },
@@ -842,7 +1176,7 @@ class WebGPUBackend {
           ],
         }],
       },
-      fragment: { module: streamMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
+      fragment: { module: streamMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat, blend: alphaBlend }] },
       primitive: { topology: 'line-list' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
       multisample: { count: 4 },
@@ -856,23 +1190,24 @@ class WebGPUBackend {
 
     this.splatPass = new ProceduralSplatPass(
       device,
-      format,
+      hdrFormat,
       this.uniformBuf,
       this.sdfGi.sdfView,
       this.linearSampler,
       this.sdfGi.radViewB,
       this.billboardQuadBuf,
     );
+    this.botanicalPass = new BotanicalScatterPass(device, hdrFormat, this.litBindGroupLayout);
 
-    this.soilGeomBuf = device.createBuffer({ size: 2048 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.soilGeomBuf = device.createBuffer({ size: 12000 * 28, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.glassGeomBuf = device.createBuffer({ size: 1024 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.lineGeomBuf = device.createBuffer({ size: 2048 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.obstacleGeomBuf = device.createBuffer({ size: 24000 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.streamGeomBuf = device.createBuffer({ size: 32000 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
 
-    this.mushVertCap = 16384;
-    this.mushVertBuf = device.createBuffer({ size: this.mushVertCap * 48, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.mushIdxCap = 32768;
+    this.mushVertCap = 32768;
+    this.mushVertBuf = device.createBuffer({ size: this.mushVertCap * 64, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.mushIdxCap = 131072;
     this.mushIdxBuf = device.createBuffer({ size: this.mushIdxCap * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
     this.mycSegCap = 4096;
     this.mycSegBuf = device.createBuffer({ size: this.mycSegCap * 32, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
@@ -881,23 +1216,21 @@ class WebGPUBackend {
   resize(width: number, height: number): void {
     const w = Math.max(1, Math.floor(width));
     const h = Math.max(1, Math.floor(height));
-    if (w === this.width && h === this.height && this.msaaColorTex && this.depthTex) return;
+    if (w === this.width && h === this.height && this.depthTex && this.depthTexView) {
+      this.postPass.ensureTargets(w, h, this.depthTexView);
+      return;
+    }
     this.width = w;
     this.height = h;
-    this.msaaColorTex?.destroy();
     this.depthTex?.destroy();
-    this.msaaColorTex = this.device.createTexture({
-      size: [w, h, 1],
-      sampleCount: 4,
-      format: this.format,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT,
-    });
     this.depthTex = this.device.createTexture({
       size: [w, h, 1],
       sampleCount: 4,
       format: 'depth24plus',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
+    this.depthTexView = this.depthTex.createView();
+    this.postPass.ensureTargets(w, h, this.depthTexView);
   }
 
   private ensureTextures(nx: number, ny: number, nz: number, spNx: number, spNz: number): void {
@@ -934,6 +1267,8 @@ class WebGPUBackend {
           { binding: 3, resource: this.sporePrintTex.createView({ dimension: '2d' }) },
           { binding: 4, resource: this.sdfGi.sdfView },
           { binding: 5, resource: this.sdfGi.radViewB },
+          { binding: 6, resource: this.shadowPass.shadowView },
+          { binding: 7, resource: this.shadowPass.shadowSampler },
         ],
       });
     }
@@ -941,6 +1276,10 @@ class WebGPUBackend {
 
   getSdfBounds(): SdfVolumeBounds {
     return this.sdfGi.bounds;
+  }
+
+  computeLightViewProj(lightDir: Readonly<Vec3>, outMat: Float32Array): void {
+    this.shadowPass.computeLightViewProj(lightDir, outMat);
   }
 
   renderFrame(
@@ -981,11 +1320,11 @@ class WebGPUBackend {
     streamVertData: Float32Array,
     streamVertCount: number,
   ): void {
-    if (!this.msaaColorTex || !this.depthTex) return;
+    if (!this.depthTex || !this.depthTexView) return;
     this.ensureTextures(nx, ny, nz, spNx, spNz);
 
-    this.device.queue.writeBuffer(this.uniformBuf, 0, uniformMain.buffer, uniformMain.byteOffset, 256);
-    this.device.queue.writeBuffer(this.uniformBufOcc, 0, uniformOcc.buffer, uniformOcc.byteOffset, 256);
+    this.device.queue.writeBuffer(this.uniformBuf, 0, uniformMain.buffer, uniformMain.byteOffset, 384);
+    this.device.queue.writeBuffer(this.uniformBufOcc, 0, uniformOcc.buffer, uniformOcc.byteOffset, 384);
 
     if (this.soilTex) {
       this.device.queue.writeTexture(
@@ -1024,14 +1363,14 @@ class WebGPUBackend {
       if (mushVertCount > this.mushVertCap) {
         this.mushVertCap = Math.max(mushVertCount, this.mushVertCap * 2);
         this.mushVertBuf.destroy();
-        this.mushVertBuf = this.device.createBuffer({ size: this.mushVertCap * 48, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+        this.mushVertBuf = this.device.createBuffer({ size: this.mushVertCap * 64, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
       }
       if (mushIndexCount > this.mushIdxCap) {
         this.mushIdxCap = Math.max(mushIndexCount, this.mushIdxCap * 2);
         this.mushIdxBuf.destroy();
         this.mushIdxBuf = this.device.createBuffer({ size: this.mushIdxCap * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
       }
-      this.device.queue.writeBuffer(this.mushVertBuf, 0, mushVertData.buffer, mushVertData.byteOffset, mushVertCount * 48);
+      this.device.queue.writeBuffer(this.mushVertBuf, 0, mushVertData.buffer, mushVertData.byteOffset, mushVertCount * 64);
       this.device.queue.writeBuffer(this.mushIdxBuf, 0, mushIndices.buffer, mushIndices.byteOffset, mushIndexCount * 4);
     }
 
@@ -1043,6 +1382,8 @@ class WebGPUBackend {
       }
       this.device.queue.writeBuffer(this.mycSegBuf, 0, mycSegData.buffer, mycSegData.byteOffset, mycSegCount * 32);
     }
+
+    this.botanicalPass.update(snapshot);
 
     const encoder = this.device.createCommandEncoder();
     // Stage 1 Fast-SDF-AO & 2-Bounce World Radiance Volume GI compute pass (throttled when static)
@@ -1069,24 +1410,41 @@ class WebGPUBackend {
       this.height,
     );
 
+    // Stage 3 2048x2048 Directional PCF Shadow Map Pass
+    this.shadowPass.render(
+      encoder,
+      this.simpleBindGroup,
+      this.mushVertBuf,
+      this.mushIdxBuf,
+      mushIndexCount,
+      this.obstacleGeomBuf,
+      obsVertCount,
+      this.soilGeomBuf,
+      soilVertCount,
+    );
+
     const swapView = this.context.getCurrentTexture().createView();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
-        view: this.msaaColorTex.createView(),
-        resolveTarget: swapView,
-        clearValue: { r: 0.047, g: 0.063, b: 0.082, a: 1.0 }, // #0c1015 obsidian bench
+        view: this.postPass.getHdrMsaaView(),
+        resolveTarget: this.postPass.getHdrResolveView(),
+        clearValue: { r: 0.011, g: 0.015, b: 0.023, a: 1.0 },
         loadOp: 'clear',
         storeOp: 'discard',
       }],
       depthStencilAttachment: {
-        view: this.depthTex.createView(),
+        view: this.depthTexView,
         depthClearValue: 1.0,
         depthLoadOp: 'clear',
         depthStoreOp: 'store',
       },
     });
 
-    // 1. Soil cutaway + plinth + razor slice
+    // 0. Subtle studio gradient backdrop
+    pass.setPipeline(this.backdropPipe);
+    pass.draw(3);
+
+    // 1. Displaced soil heightfield + cutaway + plinth + razor slice
     if (this.soilBindGroup && soilVertCount > 0) {
       pass.setPipeline(this.soilPipe);
       pass.setBindGroup(0, this.soilBindGroup);
@@ -1094,7 +1452,12 @@ class WebGPUBackend {
       pass.draw(soilVertCount);
     }
 
-    // 2. Solid obstacles (twigs & stones)
+    // 2. Instanced micro-botanical forest floor (oak leaves, moss fronds, conifer needles, pebbles)
+    if (view.xrayMode === 'none') {
+      this.botanicalPass.draw(pass, this.litBindGroup);
+    }
+
+    // 3. Solid obstacles (twigs & stones)
     if (obsVertCount > 0) {
       pass.setPipeline(this.solidPipe);
       pass.setBindGroup(0, this.litBindGroup);
@@ -1102,7 +1465,7 @@ class WebGPUBackend {
       pass.draw(obsVertCount);
     }
 
-    // 3. Waxy Chitin SSS Mushrooms
+    // 4. Species Macro PBR + Waxy Chitin SSS Mushrooms
     if (mushVertCount > 0 && mushIndexCount > 0) {
       pass.setPipeline(this.mushPipe);
       pass.setBindGroup(0, this.litBindGroup);
@@ -1111,7 +1474,7 @@ class WebGPUBackend {
       pass.drawIndexed(mushIndexCount);
     }
 
-    // 4. 3D Mycelial Network (exposed pass + subterranean cutaway glow pass)
+    // 5. 3D Mycelial Network (exposed pass + subterranean depth-cued pass)
     if (showMycelium && mycSegCount > 0) {
       pass.setPipeline(this.mycPipe);
       pass.setBindGroup(0, this.simpleBindGroup);
@@ -1126,7 +1489,7 @@ class WebGPUBackend {
       pass.draw(6, mycSegCount);
     }
 
-    // 5. Evaporative convective wind streamlines
+    // 6. Evaporative convective wind streamlines
     if (streamVertCount > 0) {
       pass.setPipeline(this.streamPipe);
       pass.setBindGroup(0, this.simpleBindGroup);
@@ -1134,10 +1497,10 @@ class WebGPUBackend {
       pass.draw(streamVertCount);
     }
 
-    // 6. Sorted Hybrid Procedural 3D Gaussian Splats (moss/litter, mycelial halo, cap fuzz, spore mist)
+    // 7. Sorted Hybrid Procedural 3D Gaussian Splats (moss/litter, mycelial halo, cap fuzz, spore mist)
     this.splatPass.draw(pass);
 
-    // 7. Museum glass walls & optical wireframe hairlines
+    // 8. Physical museum glass walls w/ RH condensation & optical wireframe hairlines
     if (glassVertCount > 0) {
       pass.setPipeline(this.glassPipe);
       pass.setBindGroup(0, this.litBindGroup);
@@ -1152,13 +1515,27 @@ class WebGPUBackend {
     }
 
     pass.end();
+
+    // Stage 4 Half-Res HDR Bloom + Macro Bokeh DoF + ACES Filmic Composite -> Swapchain
+    this.postPass.renderPost(
+      encoder,
+      swapView,
+      uniformMain[84],
+      uniformMain[85],
+      uniformMain[86],
+      uniformMain[31],
+      view.sliceEnabled,
+    );
+
     this.device.queue.submit([encoder.finish()]);
   }
 
   dispose(): void {
+    this.postPass.dispose();
+    this.botanicalPass.dispose();
+    this.shadowPass.dispose();
     this.splatPass.dispose();
     this.sdfGi.dispose();
-    this.msaaColorTex?.destroy();
     this.depthTex?.destroy();
     this.soilTex?.destroy();
     this.sporePrintTex?.destroy();
@@ -1577,18 +1954,27 @@ export class TerrariumRenderer {
   private vpMat = new Float32Array(16);
   private mvpMat = new Float32Array(16);
   private invMvpMat = new Float32Array(16);
+  private lightViewProjMat = new Float32Array(16);
 
-  private uniformMain = new Float32Array(64);
-  private uniformOcc = new Float32Array(64);
+  private uniformMain = new Float32Array(96);
+  private uniformOcc = new Float32Array(96);
 
   private soilTexScratch = new Uint8Array(48 * 32 * 48 * 4);
   private sporeTexScratch = new Uint8Array(64 * 64);
-  private soilVertsScratch = new Float32Array(2048);
+  private soilVertsScratch = new Float32Array(12000 * 7);
   private glassVertsScratch = new Float32Array(1024);
   private lineVertsScratch = new Float32Array(2048);
   private obsVertsScratch = new Float32Array(24000);
   private streamVertsScratch = new Float32Array(32000);
   private mushInterleavedScratch = new Float32Array(16384 * 12);
+  private mushSubdivState: MushSubdivState = {
+    verts: new Float32Array(32768 * 16),
+    indices: new Uint32Array(131072),
+    vertCount: 0,
+    indexCount: 0,
+  };
+  private cachedSoilSig = '';
+  private cachedSoilVertCount = 0;
   private sporePosScratch = new Float32Array(2048 * 4);
   private sporeVelScratch = new Float32Array(2048 * 4);
 
@@ -1755,6 +2141,43 @@ export class TerrariumRenderer {
     u[56] = localRightX; u[57] = localRightY; u[58] = rawRz; u[59] = this.pixelWidth;
     u[60] = localUpX; u[61] = localUpY; u[62] = rawUz; u[63] = this.pixelHeight;
 
+    // Pack extended studio-macro uniforms (floats 64..95 -> bytes 256..384)
+    if (this.gpuBackend) {
+      this.gpuBackend.computeLightViewProj(lDir, this.lightViewProjMat);
+    } else {
+      mat4Identity(this.lightViewProjMat);
+    }
+    u.set(this.lightViewProjMat, 64);
+    const speciesIdx =
+      snapshot.species.id === 'parasol'
+        ? 0
+        : snapshot.species.id === 'chanterelle'
+          ? 1
+          : snapshot.species.id === 'morel'
+            ? 2
+            : 3;
+    u[80] = speciesIdx;
+    u[81] = 1.0;
+    u[82] = 0.02;
+    u[83] = 8.0;
+    const focusDistM = Math.hypot(
+      eye[0] - view.cameraTarget[0],
+      eye[1] - view.cameraTarget[1],
+      eye[2] - view.cameraTarget[2],
+    );
+    u[84] = focusDistM;
+    u[85] = 0.28;
+    u[86] = 0.14;
+    u[87] = 1.0;
+    u[88] = 0;
+    u[89] = 0;
+    u[90] = 0;
+    u[91] = 0;
+    u[92] = 0;
+    u[93] = 0;
+    u[94] = 0;
+    u[95] = 0;
+
     // Occluded subterranean mycelium uniform copy (soft translucent window through dark earth)
     this.uniformOcc.set(u);
     this.uniformOcc[35] = view.xrayMode === 'turgor_p' ? 0.62 : 0.34;
@@ -1776,8 +2199,23 @@ export class TerrariumRenderer {
       packSporePrintTexture2D(snapshot, this.sporeTexScratch);
     }
 
-    // Build dynamic scene geometry into scratch buffers
-    const soilVertCount = buildSoilAndSliceMesh(this.soilVertsScratch, bounds, view);
+    // Build dynamic scene geometry into scratch buffers (cached displaced heightfield terrain)
+    let soilSig = `${snapshot.species.id}:${snapshot.obstacles.length}:${bounds.minX.toFixed(4)},${bounds.maxX.toFixed(4)},${bounds.minY.toFixed(4)},${bounds.maxY.toFixed(4)},${bounds.minZ.toFixed(4)},${bounds.maxZ.toFixed(4)}:${view.sliceEnabled ? 1 : 0}:${view.sliceAxis}:${sliceCoord.toFixed(4)}:${snapshot.bodies.length}`;
+    for (let i = 0; i < snapshot.bodies.length; i++) {
+      const b = snapshot.bodies[i];
+      soilSig += `|${b.id},${b.baseX.toFixed(4)},${b.baseZ.toFixed(4)}`;
+    }
+    if (soilSig !== this.cachedSoilSig) {
+      this.cachedSoilSig = soilSig;
+      this.cachedSoilVertCount = buildSoilAndSliceMesh(
+        this.soilVertsScratch,
+        bounds,
+        view,
+        snapshot.soil,
+        snapshot.bodies,
+      );
+    }
+    const soilVertCount = this.cachedSoilVertCount;
     const obsVertCount = buildObstaclesMesh(snapshot.obstacles, this.obsVertsScratch);
     const airTopY = snapshot.airField?.bounds?.maxY ?? 0.30;
     const { glassVerts, lineVerts } = buildGlassArchitecture(
@@ -1793,11 +2231,13 @@ export class TerrariumRenderer {
         ? buildWindStreamlines(snapshot, this.streamVertsScratch)
         : 0;
 
-    // Pack mushroom interleaved vertices (12 floats per vertex)
     const mesh = snapshot.fruitingMesh;
     const mushVertCount = mesh.vertexCount;
     const mushIndexCount = mesh.indexCount;
-    if (mushVertCount > 0 && mushIndexCount > 0) {
+    if (this.gpuBackend) {
+      packSubdividedMushroomMesh(mesh, snapshot.bodies, this.mushSubdivState);
+    } else if (mushVertCount > 0 && mushIndexCount > 0) {
+      // Pack WebGL2 interleaved vertices (12 floats per vertex)
       const needed = mushVertCount * 12;
       if (this.mushInterleavedScratch.length < needed) {
         this.mushInterleavedScratch = new Float32Array(Math.max(needed, this.mushInterleavedScratch.length * 2));
@@ -1877,10 +2317,10 @@ export class TerrariumRenderer {
         sp.nz,
         this.soilVertsScratch,
         soilVertCount,
-        this.mushInterleavedScratch,
-        mushVertCount,
-        mesh.indices,
-        mushIndexCount,
+        this.mushSubdivState.verts,
+        this.mushSubdivState.vertCount,
+        this.mushSubdivState.indices,
+        this.mushSubdivState.indexCount,
         snapshot.mycelium.segments,
         snapshot.mycelium.segmentCount,
         view.showMycelium,
