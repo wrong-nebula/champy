@@ -76,7 +76,7 @@ async function bootstrap(): Promise<void> {
       }
     },
     onLightingMoodChange(mood: LightingMood): void {
-      (renderer as unknown as { setLightingMood?: (m: LightingMood) => void })?.setLightingMood?.(mood);
+      renderer?.setLightingMood(mood);
     },
     onDrainSoil(): void {
       engine.drainSoil();
@@ -120,9 +120,7 @@ async function bootstrap(): Promise<void> {
 
   renderer = await TerrariumRenderer.create(ui.canvas);
   ui.setRendererBackend(renderer.backend);
-  (renderer as unknown as { setLightingMood?: (m: LightingMood) => void })?.setLightingMood?.(
-    ui.getLightingMood(),
-  );
+  renderer.setLightingMood(ui.getLightingMood());
 
   const syncCanvasSize = (): void => {
     if (!renderer) return;

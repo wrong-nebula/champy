@@ -57,6 +57,14 @@ import { evalSoilSurfaceHeightM, evalSoilSurfaceNormal } from './terrainHeight.t
 import { ShadowMapPass } from './ShadowMapPass.ts';
 import { BotanicalScatterPass } from './BotanicalScatterPass.ts';
 import { PostProcessPass } from './PostProcessPass.ts';
+import { StudioIbl } from './StudioIbl.ts';
+import { packSculptedMushroomMesh, type MushSubdivState } from './MushroomGeometry.ts';
+import {
+  buildCurvedMyceliumSegments,
+  MAX_CURVED_MYCELIUM_SEGMENTS,
+  type CurvedMyceliumState,
+} from './MyceliumGeometry.ts';
+import type { LightingMood } from '../ui/LabUI.ts';
 
 export type RendererBackend = 'webgpu' | 'webgl2';
 
@@ -309,202 +317,6 @@ function buildSoilAndSliceMesh(
     }
   }
   return o / 7;
-}
-
-const SUBDIV_EDGE_HASH_SIZE = 65536;
-const subdivHashKeyLo = new Int32Array(SUBDIV_EDGE_HASH_SIZE);
-const subdivHashKeyHi = new Int32Array(SUBDIV_EDGE_HASH_SIZE);
-const subdivHashVal = new Int32Array(SUBDIV_EDGE_HASH_SIZE);
-
-interface MushSubdivState {
-  verts: Float32Array;
-  indices: Uint32Array;
-  vertCount: number;
-  indexCount: number;
-}
-
-/**
- * Packs mushroom geometry into 64-byte (16-float) WebGPU vertices with botanical
- * coordinates (dxNorm, dzNorm, relY, bodySeed) and applies 1-level PN-curved
- * midpoint subdivision when triangle count <= 10,000.
- */
-function packSubdividedMushroomMesh(
-  mesh: SimulationSnapshot['fruitingMesh'],
-  bodies: readonly FruitingBodyState[],
-  state: MushSubdivState,
-): void {
-  const origV = mesh.vertexCount;
-  const origI = mesh.indexCount;
-  if (origV <= 0 || origI <= 0) {
-    state.vertCount = 0;
-    state.indexCount = 0;
-    return;
-  }
-
-  const triCount = Math.floor(origI / 3);
-  const doSubdiv = triCount > 0 && triCount <= 10000 && origV < 32768;
-  const maxVertsNeeded = doSubdiv ? origV + triCount * 3 : origV;
-  const maxIdxNeeded = doSubdiv ? triCount * 12 : origI;
-
-  if (state.verts.length < maxVertsNeeded * 16) {
-    state.verts = new Float32Array(Math.max(maxVertsNeeded * 16, state.verts.length * 2));
-  }
-  if (state.indices.length < maxIdxNeeded) {
-    state.indices = new Uint32Array(Math.max(maxIdxNeeded, state.indices.length * 2));
-  }
-
-  const dst = state.verts;
-  const outIndices = state.indices;
-  const pos = mesh.positions;
-  const nrm = mesh.normals;
-  const col = mesh.colors;
-  const str = mesh.stressVM;
-  const tur = mesh.turgorPa;
-  const pid = mesh.partIds;
-  const bodyCount = bodies.length;
-
-  for (let i = 0; i < origV; i++) {
-    const i3 = i * 3;
-    const o = i * 16;
-    const px = pos[i3];
-    const py = pos[i3 + 1];
-    const pz = pos[i3 + 2];
-    const partId = pid[i];
-
-    dst[o] = px;
-    dst[o + 1] = py;
-    dst[o + 2] = pz;
-    dst[o + 3] = nrm[i3];
-    dst[o + 4] = nrm[i3 + 1];
-    dst[o + 5] = nrm[i3 + 2];
-    dst[o + 6] = col[i3];
-    dst[o + 7] = col[i3 + 1];
-    dst[o + 8] = col[i3 + 2];
-    dst[o + 9] = str[i];
-    dst[o + 10] = tur[i];
-    dst[o + 11] = partId;
-
-    if (bodyCount > 0) {
-      let best = bodies[0];
-      if (bodyCount > 1) {
-        let bestD2 = Infinity;
-        for (let bi = 0; bi < bodyCount; bi++) {
-          const b = bodies[bi];
-          const rx = partId < 0.5 ? 0.5 * (b.baseX + b.stipeTipX) : b.stipeTipX;
-          const ry = partId < 0.5 ? 0.5 * (b.baseY + b.stipeTipY) : b.stipeTipY;
-          const rz = partId < 0.5 ? 0.5 * (b.baseZ + b.stipeTipZ) : b.stipeTipZ;
-          const d2 = (px - rx) * (px - rx) + (py - ry) * (py - ry) + (pz - rz) * (pz - rz);
-          if (d2 < bestD2) {
-            bestD2 = d2;
-            best = b;
-          }
-        }
-      }
-      const capR = Math.max(best.capRadiusM, 0.012);
-      dst[o + 12] = (px - best.stipeTipX) / capR;
-      dst[o + 13] = (pz - best.stipeTipZ) / capR;
-      dst[o + 14] = (py - best.baseY) / Math.max(best.stipeLengthM + 0.015, 0.02);
-      dst[o + 15] = (best.id * 1.6180339) % 6.2831853;
-    } else {
-      dst[o + 12] = 0;
-      dst[o + 13] = 0;
-      dst[o + 14] = 0.5;
-      dst[o + 15] = 0;
-    }
-  }
-
-  if (!doSubdiv) {
-    outIndices.set(mesh.indices.subarray(0, origI));
-    state.vertCount = origV;
-    state.indexCount = origI;
-    return;
-  }
-
-  subdivHashKeyLo.fill(-1);
-  let nextVert = origV;
-  let outIdx = 0;
-  const srcIdx = mesh.indices;
-
-  const getOrMakeMid = (a: number, b: number): number => {
-    const lo = a < b ? a : b;
-    const hi = a < b ? b : a;
-    let slot = ((lo * 73856093) ^ (hi * 19349663)) & (SUBDIV_EDGE_HASH_SIZE - 1);
-    for (let p = 0; p < 64; p++) {
-      const kLo = subdivHashKeyLo[slot];
-      if (kLo === -1) {
-        const mid = nextVert++;
-        const ao = a * 16;
-        const bo = b * 16;
-        const mo = mid * 16;
-
-        const ax = dst[ao], ay = dst[ao + 1], az = dst[ao + 2];
-        const bx = dst[bo], by = dst[bo + 1], bz = dst[bo + 2];
-        const nax = dst[ao + 3], nay = dst[ao + 4], naz = dst[ao + 5];
-        const nbx = dst[bo + 3], nby = dst[bo + 4], nbz = dst[bo + 5];
-
-        const nd = Math.max(-1, Math.min(1, nax * nbx + nay * nby + naz * nbz));
-        const crispEdge = dst[ao + 11] >= 1.5 || dst[bo + 11] >= 1.5;
-        const smoothK = Math.max(0, Math.min(1, (nd - 0.30) / 0.70)) * (crispEdge ? 0.12 : 1.0);
-        const dax = ax - bx, day = ay - by, daz = az - bz;
-        const wA = dax * nax + day * nay + daz * naz;
-        const wB = -dax * nbx - day * nby - daz * nbz;
-        const pn = 0.125 * smoothK;
-
-        dst[mo] = 0.5 * (ax + bx) + pn * (wA * nax + wB * nbx);
-        dst[mo + 1] = 0.5 * (ay + by) + pn * (wA * nay + wB * nby);
-        dst[mo + 2] = 0.5 * (az + bz) + pn * (wA * naz + wB * nbz);
-
-        const mnx = nax + nbx;
-        const mny = nay + nby;
-        const mnz = naz + nbz;
-        const mnLen = Math.hypot(mnx, mny, mnz);
-        if (mnLen > 1e-6) {
-          const inv = 1 / mnLen;
-          dst[mo + 3] = mnx * inv;
-          dst[mo + 4] = mny * inv;
-          dst[mo + 5] = mnz * inv;
-        } else {
-          dst[mo + 3] = 0;
-          dst[mo + 4] = 1;
-          dst[mo + 5] = 0;
-        }
-
-        for (let k = 6; k < 16; k++) {
-          dst[mo + k] = 0.5 * (dst[ao + k] + dst[bo + k]);
-        }
-
-        subdivHashKeyLo[slot] = lo;
-        subdivHashKeyHi[slot] = hi;
-        subdivHashVal[slot] = mid;
-        return mid;
-      }
-      if (kLo === lo && subdivHashKeyHi[slot] === hi) {
-        return subdivHashVal[slot];
-      }
-      slot = (slot + 1) & (SUBDIV_EDGE_HASH_SIZE - 1);
-    }
-    return lo;
-  };
-
-  for (let t = 0; t < triCount; t++) {
-    const t3 = t * 3;
-    const i0 = srcIdx[t3];
-    const i1 = srcIdx[t3 + 1];
-    const i2 = srcIdx[t3 + 2];
-    if (i0 >= origV || i1 >= origV || i2 >= origV) continue;
-
-    const m01 = getOrMakeMid(i0, i1);
-    const m12 = getOrMakeMid(i1, i2);
-    const m20 = getOrMakeMid(i2, i0);
-
-    outIndices[outIdx++] = i0; outIndices[outIdx++] = m01; outIndices[outIdx++] = m20;
-    outIndices[outIdx++] = m01; outIndices[outIdx++] = i1; outIndices[outIdx++] = m12;
-    outIndices[outIdx++] = m20; outIndices[outIdx++] = m12; outIndices[outIdx++] = i2;
-    outIndices[outIdx++] = m01; outIndices[outIdx++] = m12; outIndices[outIdx++] = m20;
-  }
-
-  state.vertCount = nextVert;
-  state.indexCount = outIdx;
 }
 
 function appendSolidTri(
@@ -912,6 +724,7 @@ class WebGPUBackend {
   private shadowPass: ShadowMapPass;
   private botanicalPass: BotanicalScatterPass;
   private postPass: PostProcessPass;
+  private studioIbl: StudioIbl;
   private lastGiSig = '';
   private giTick = 0;
 
@@ -995,6 +808,7 @@ class WebGPUBackend {
     });
 
     this.shadowPass = new ShadowMapPass(device, this.simpleBindGroupLayout);
+    this.studioIbl = new StudioIbl(device);
 
     this.soilBindGroupLayout = device.createBindGroupLayout({
       entries: [
@@ -1006,6 +820,8 @@ class WebGPUBackend {
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
         { binding: 7, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+        { binding: 8, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: 'cube' } },
+        { binding: 9, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
 
@@ -1017,6 +833,8 @@ class WebGPUBackend {
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: 'cube' } },
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
       ],
     });
 
@@ -1029,6 +847,8 @@ class WebGPUBackend {
         { binding: 3, resource: this.sdfGi.radViewB },
         { binding: 4, resource: this.shadowPass.shadowView },
         { binding: 5, resource: this.shadowPass.shadowSampler },
+        { binding: 6, resource: this.studioIbl.cubeView },
+        { binding: 7, resource: this.studioIbl.sampler },
       ],
     });
 
@@ -1037,9 +857,12 @@ class WebGPUBackend {
       alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
     };
 
+    const simpleLayout = device.createPipelineLayout({ bindGroupLayouts: [this.simpleBindGroupLayout] });
+    const litLayout = device.createPipelineLayout({ bindGroupLayouts: [this.litBindGroupLayout] });
+
     const backMod = device.createShaderModule({ code: BACKDROP_WGSL });
     this.backdropPipe = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [] }),
+      layout: simpleLayout,
       vertex: { module: backMod, entryPoint: 'vs_main' },
       fragment: { module: backMod, entryPoint: 'fs_main', targets: [{ format: hdrFormat }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
@@ -1067,9 +890,6 @@ class WebGPUBackend {
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
       multisample: { count: 4 },
     });
-
-    const simpleLayout = device.createPipelineLayout({ bindGroupLayouts: [this.simpleBindGroupLayout] });
-    const litLayout = device.createPipelineLayout({ bindGroupLayouts: [this.litBindGroupLayout] });
 
     const mycMod = device.createShaderModule({ code: MYCELIUM_WGSL });
     const mycVertBuffers: GPUVertexBufferLayout[] = [
@@ -1209,7 +1029,7 @@ class WebGPUBackend {
     this.mushVertBuf = device.createBuffer({ size: this.mushVertCap * 64, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.mushIdxCap = 131072;
     this.mushIdxBuf = device.createBuffer({ size: this.mushIdxCap * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
-    this.mycSegCap = 4096;
+    this.mycSegCap = MAX_CURVED_MYCELIUM_SEGMENTS;
     this.mycSegBuf = device.createBuffer({ size: this.mycSegCap * 32, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
   }
 
@@ -1269,6 +1089,8 @@ class WebGPUBackend {
           { binding: 5, resource: this.sdfGi.radViewB },
           { binding: 6, resource: this.shadowPass.shadowView },
           { binding: 7, resource: this.shadowPass.shadowSampler },
+          { binding: 8, resource: this.studioIbl.cubeView },
+          { binding: 9, resource: this.studioIbl.sampler },
         ],
       });
     }
@@ -1442,6 +1264,7 @@ class WebGPUBackend {
 
     // 0. Subtle studio gradient backdrop
     pass.setPipeline(this.backdropPipe);
+    pass.setBindGroup(0, this.simpleBindGroup);
     pass.draw(3);
 
     // 1. Displaced soil heightfield + cutaway + plinth + razor slice
@@ -1525,12 +1348,15 @@ class WebGPUBackend {
       uniformMain[86],
       uniformMain[31],
       view.sliceEnabled,
+      uniformMain[88],
+      uniformMain[89],
     );
 
     this.device.queue.submit([encoder.finish()]);
   }
 
   dispose(): void {
+    this.studioIbl.dispose();
     this.postPass.dispose();
     this.botanicalPass.dispose();
     this.shadowPass.dispose();
@@ -1975,6 +1801,12 @@ export class TerrariumRenderer {
   };
   private cachedSoilSig = '';
   private cachedSoilVertCount = 0;
+  private lightingMood: LightingMood = 'studio';
+  private readonly startTimeMs = performance.now();
+  private curvedMyceliumState: CurvedMyceliumState = {
+    segments: new Float32Array(MAX_CURVED_MYCELIUM_SEGMENTS * 8),
+    count: 0,
+  };
   private sporePosScratch = new Float32Array(2048 * 4);
   private sporeVelScratch = new Float32Array(2048 * 4);
 
@@ -2049,6 +1881,10 @@ export class TerrariumRenderer {
     }
     this.gpuBackend?.resize(this.pixelWidth, this.pixelHeight);
     this.glBackend?.resize(this.pixelWidth, this.pixelHeight);
+  }
+
+  setLightingMood(mood: LightingMood): void {
+    this.lightingMood = mood;
   }
 
   private computeCameraMatrices(snapshot: SimulationSnapshot, view: ViewState): Vec3 {
@@ -2165,14 +2001,16 @@ export class TerrariumRenderer {
       eye[1] - view.cameraTarget[1],
       eye[2] - view.cameraTarget[2],
     );
+    const moodIdx = this.lightingMood === 'canopy' ? 1 : this.lightingMood === 'backlit' ? 2 : 0;
+    const realTimeSec = ((performance.now() - this.startTimeMs) * 0.001) % 600;
     u[84] = focusDistM;
     u[85] = 0.28;
     u[86] = 0.14;
     u[87] = 1.0;
-    u[88] = 0;
-    u[89] = 0;
-    u[90] = 0;
-    u[91] = 0;
+    u[88] = moodIdx;
+    u[89] = realTimeSec;
+    u[90] = moodIdx === 1 ? 1.0 : 0.0;
+    u[91] = 1.0;
     u[92] = 0;
     u[93] = 0;
     u[94] = 0;
@@ -2235,7 +2073,7 @@ export class TerrariumRenderer {
     const mushVertCount = mesh.vertexCount;
     const mushIndexCount = mesh.indexCount;
     if (this.gpuBackend) {
-      packSubdividedMushroomMesh(mesh, snapshot.bodies, this.mushSubdivState);
+      packSculptedMushroomMesh(mesh, snapshot.bodies, snapshot.species.id, this.mushSubdivState);
     } else if (mushVertCount > 0 && mushIndexCount > 0) {
       // Pack WebGL2 interleaved vertices (12 floats per vertex)
       const needed = mushVertCount * 12;
@@ -2299,6 +2137,15 @@ export class TerrariumRenderer {
     }
 
     if (this.gpuBackend) {
+      if (view.showMycelium && snapshot.mycelium.segmentCount > 0) {
+        buildCurvedMyceliumSegments(
+          snapshot.mycelium.segments,
+          snapshot.mycelium.segmentCount,
+          this.curvedMyceliumState,
+        );
+      } else {
+        this.curvedMyceliumState.count = 0;
+      }
       this.gpuBackend.renderFrame(
         snapshot,
         view,
@@ -2321,8 +2168,8 @@ export class TerrariumRenderer {
         this.mushSubdivState.vertCount,
         this.mushSubdivState.indices,
         this.mushSubdivState.indexCount,
-        snapshot.mycelium.segments,
-        snapshot.mycelium.segmentCount,
+        this.curvedMyceliumState.segments,
+        this.curvedMyceliumState.count,
         view.showMycelium,
         this.obsVertsScratch,
         obsVertCount,
