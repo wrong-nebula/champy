@@ -1,0 +1,23 @@
+{
+  "name": "sporocarp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SPOROCARP — First-Principles Multi-Scale Mushroom Morphogenesis, Forest Soil Hydraulics & Spore-Physics Bench",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "verify": "tsx verify_sporocarp.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@webgpu/types": "^0.1.50",
+    "playwright-core": "^1.50.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}
