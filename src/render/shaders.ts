@@ -29,7 +29,7 @@ struct SceneUniforms {
   speciesExtra: vec4<f32>,  // x = speciesIdx (0..4), y = shadowEnabled, z = near, w = far
   postParams: vec4<f32>,    // x = focusDistM, y = dofStrength, z = bloomStrength, w = rimStrength
   padExtra: vec4<f32>,
-  biolumInfo: vec4<f32>,    // x = biolumIntensity 0..2.5, y = nocturnalFactor 0..1, z = meanO2Factor, w = circadianFactor
+  biolumInfo: vec4<f32>,    // x = biolumIntensity 0..2.5 (bodies+foxfire), y = nocturnalFactor 0..1, z = meanO2Factor, w = bodyGlow 0..2.5
 };
 
 fn isClippedBySlice(p: vec3<f32>, sliceParams: vec4<f32>) -> bool {
@@ -1192,9 +1192,9 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
   }
 
   // Real narrowband 525 nm fungal bioluminescence (Mycena gills/fluted margin/stipe; never over X-Ray modes)
-  if (xrayMode == 0 && u.biolumInfo.x > 0.001) {
+  if (xrayMode == 0 && u.biolumInfo.w > 0.001) {
     let biolumCol525 = vec3<f32>(0.045, 0.98, 0.22);
-    let glow = u.biolumInfo.x * mix(0.18, 1.75, noct);
+    let glow = u.biolumInfo.w * mix(0.18, 1.75, noct);
     var emitMask = 0.0;
     if (partId == 2) {
       // Brightest on underside gills with subtle radial structure
@@ -1374,7 +1374,8 @@ fn fs_main(in: SporeVertOut) -> @location(0) vec4<f32> {
   let lifted = clamp(in.liftM / 0.03, 0.0, 1.0);
   let baseCol = mix(max(u.sporePrintColor.rgb * 1.4, vec3<f32>(0.55, 0.50, 0.44)), vec3<f32>(0.42, 0.86, 0.98), lifted * 0.72);
   let core = mix(baseCol, vec3<f32>(1.0, 0.96, 0.86), smoothstep(0.6, 1.0, soft) * 0.45);
-  return vec4<f32>(core, soft * 0.86);
+  let noct = max(clamp(u.biolumInfo.y, 0.0, 1.0), smoothstep(2.4, 2.9, u.padExtra.x));
+  return vec4<f32>(core * mix(1.0, 0.22, noct), soft * 0.86);
 }
 `;
 
@@ -1406,7 +1407,11 @@ fn vs_main(v: StreamVertIn) -> StreamVertOut {
 
 @fragment
 fn fs_main(in: StreamVertOut) -> @location(0) vec4<f32> {
-  return in.color;
+  // Under Nocturnal moonlight the flow overlay stays legible but drops to a cool, dim register
+  let noct = max(clamp(u.biolumInfo.y, 0.0, 1.0), smoothstep(2.4, 2.9, u.padExtra.x));
+  let luma = dot(in.color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let moonCol = mix(in.color.rgb, vec3<f32>(luma) * vec3<f32>(0.62, 0.78, 1.0), 0.65) * 0.26;
+  return vec4<f32>(mix(in.color.rgb, moonCol, noct), in.color.a * mix(1.0, 0.7, noct));
 }
 `;
 

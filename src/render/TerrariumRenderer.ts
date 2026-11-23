@@ -1211,10 +1211,10 @@ class WebGPUBackend {
     // Stage 1 Fast-SDF-AO & 2-Bounce World Radiance Volume GI compute pass (throttled when static)
     this.giTick++;
     const leadB = snapshot.bodies[0];
-    const giSigImmediate = `${snapshot.species.id}:${snapshot.bodies.length}:${snapshot.obstacles.length}:${view.sliceEnabled ? 1 : 0}:${view.sliceAxis}:${sliceCoord.toFixed(3)}:${lightDir[0].toFixed(2)},${lightDir[1].toFixed(2)},${lightDir[2].toFixed(2)}:${leadB ? Math.round(leadB.stipeLengthM * 250) : 0}:${leadB ? Math.round(leadB.capRadiusM * 250) : 0}`;
+    const giSigImmediate = `${uniformMain[88]}:${snapshot.species.id}:${snapshot.bodies.length}:${snapshot.obstacles.length}:${view.sliceEnabled ? 1 : 0}:${view.sliceAxis}:${sliceCoord.toFixed(3)}:${lightDir[0].toFixed(2)},${lightDir[1].toFixed(2)},${lightDir[2].toFixed(2)}:${leadB ? Math.round(leadB.stipeLengthM * 250) : 0}:${leadB ? Math.round(leadB.capRadiusM * 250) : 0}`;
     if (giSigImmediate !== this.lastGiSig || (this.giTick & 3) === 0) {
       this.lastGiSig = giSigImmediate;
-      this.sdfGi.update(encoder, snapshot, view, lightDir, sliceCoord);
+      this.sdfGi.update(encoder, snapshot, view, lightDir, sliceCoord, uniformMain[88]);
     }
 
     // Stage 2 Hybrid Procedural 3DGS compute projection & GPU radix sort
@@ -1761,6 +1761,24 @@ class WebGL2Backend {
 // Public Exported Class: TerrariumRenderer
 // ============================================================================
 
+/** Peak 525 nm photon flux the bioluminescence model normalizes against (photons / cm^2 / s). */
+const BIOLUM_PEAK_FLUX_CM2_S = 3.2e9;
+
+function lightingMoodIndex(mood: LightingMood): number {
+  switch (mood) {
+    case 'canopy': return 1;
+    case 'backlit': return 2;
+    case 'nocturnal': return 3;
+    default: return 0;
+  }
+}
+
+/** Map normalized photon flux (0..1) to shader glow 0..2.5 with a square-root (perceptual) curve. */
+function biolumPerceivedIntensity(norm: number): number {
+  if (!(norm > 0)) return 0;
+  return 2.5 * Math.sqrt(Math.min(1, norm / 0.3));
+}
+
 export class TerrariumRenderer {
   readonly backend: RendererBackend;
   private canvas: HTMLCanvasElement;
@@ -2003,7 +2021,7 @@ export class TerrariumRenderer {
       eye[1] - view.cameraTarget[1],
       eye[2] - view.cameraTarget[2],
     );
-    const moodIdx = this.lightingMood === 'canopy' ? 1 : this.lightingMood === 'backlit' ? 2 : 0;
+    const moodIdx = lightingMoodIndex(this.lightingMood);
     const realTimeSec = ((performance.now() - this.startTimeMs) * 0.001) % 600;
     u[84] = focusDistM;
     u[85] = 0.28;
@@ -2013,10 +2031,20 @@ export class TerrariumRenderer {
     u[89] = realTimeSec;
     u[90] = moodIdx === 1 ? 1.0 : 0.0;
     u[91] = 1.0;
-    u[92] = 0;
-    u[93] = 0;
-    u[94] = 0;
-    u[95] = 0;
+    // biolumInfo: x = overall 525 nm intensity (bodies + foxfire hyphae), y = nocturnal factor,
+    // z = mean soil O2 factor, w = fruiting-body glow intensity (only species with luciferase)
+    const bl = snapshot.biolum;
+    let bodyPeak = 0;
+    if (bl?.enabled) {
+      for (let i = 0; i < snapshot.bodies.length && i < bl.bodyGlow.length; i++) {
+        if (bl.bodyGlow[i] > bodyPeak) bodyPeak = bl.bodyGlow[i];
+      }
+    }
+    const fluxPeak = bl?.enabled ? bl.photonFluxCm2S / BIOLUM_PEAK_FLUX_CM2_S : 0;
+    u[92] = biolumPerceivedIntensity(fluxPeak);
+    u[93] = moodIdx === 3 ? 1.0 : 0.0;
+    u[94] = bl?.enabled ? bl.meanO2Factor : 0;
+    u[95] = biolumPerceivedIntensity(bodyPeak);
 
     // Occluded subterranean mycelium uniform copy (soft translucent window through dark earth)
     this.uniformOcc.set(u);
