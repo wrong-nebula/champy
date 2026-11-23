@@ -115,6 +115,19 @@ export function evalSoilSurfaceHeightM(
   // Keep vertical relief within natural bounds [-4 mm, +15 mm]
   h = Math.max(-0.004, Math.min(0.015, h));
 
+  // Gentle organic edge recession (1-2 mm soft bevel fading cleanly within 1.5 cm of perimeter)
+  const edgeDistX = Math.max(0, halfX - Math.abs(x));
+  const edgeDistZ = Math.max(0, halfZ - Math.abs(z));
+  const bevelWidth = Math.max(0.011, Math.min(0.015, 0.0135 + fbm2(x * 24.0 + 1.3, z * 24.0 - 2.7) * 0.003));
+  const edgeFadeX = smoothstep(0.0, bevelWidth, edgeDistX);
+  const edgeFadeZ = smoothstep(0.0, bevelWidth, edgeDistZ);
+  const edgeFade = edgeFadeX * edgeFadeZ;
+  const edgeRecession = Math.max(
+    0.0011,
+    Math.min(0.0019, 0.0015 + fbm2(x * 28.0 + 7.1, z * 28.0 - 3.9) * 0.0008),
+  );
+  h = h * edgeFade - edgeRecession * (1 - edgeFade);
+
   // Taper cleanly to y = 0 at fruiting body bases so stipes never float or bury
   for (let i = 0; i < bodies.length; i++) {
     const b = bodies[i];
