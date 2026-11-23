@@ -24,6 +24,7 @@ interface SporocarpApi {
   setView(partial: Partial<ViewState>): void;
   setEnv(partial: Partial<EnvironmentState>): void;
   setLightingMood(mood: LightingMood): void;
+  setFoxfire(enabled: boolean): void;
   stepSim(dtSec: number, steps?: number): void;
   pourRain(x: number, z: number, radius: number, depth: number): void;
   triggerFastForward(simSeconds: number): void;
@@ -48,14 +49,27 @@ async function bootstrap(): Promise<void> {
   let renderer: TerrariumRenderer | null = null;
   let lastSnapshot: SimulationSnapshot = engine.getSnapshot();
 
+  const syncUiFromEngine = (): void => {
+    const foxfire = (engine as unknown as { foxfireEnabled?: boolean }).foxfireEnabled;
+    ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused, foxfire);
+  };
+
+  const setEngineFoxfire = (enabled: boolean): void => {
+    (engine as unknown as { setFoxfireEnabled?: (v: boolean) => void }).setFoxfireEnabled?.(enabled);
+  };
+
   const callbacks: LabUICallbacks = {
     onSpeciesChange(speciesId: SpeciesId): void {
       engine.setSpecies(speciesId);
-      ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused);
+      syncUiFromEngine();
+      lastSnapshot = engine.getSnapshot();
+      ui.update(lastSnapshot, true);
     },
     onSceneChange(preset: TerrariumScenePreset): void {
       engine.setScene(preset);
-      ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused);
+      syncUiFromEngine();
+      lastSnapshot = engine.getSnapshot();
+      ui.update(lastSnapshot, true);
     },
     onTimeWarpChange(timeWarp: number): void {
       engine.setEnv({ timeWarp });
@@ -65,7 +79,9 @@ async function bootstrap(): Promise<void> {
     },
     onReset(): void {
       engine.reset();
-      ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused);
+      syncUiFromEngine();
+      lastSnapshot = engine.getSnapshot();
+      ui.update(lastSnapshot, true);
     },
     onEnvChange(patch: Partial<EnvironmentState>): void {
       engine.setEnv(patch);
@@ -77,6 +93,11 @@ async function bootstrap(): Promise<void> {
     },
     onLightingMoodChange(mood: LightingMood): void {
       renderer?.setLightingMood(mood);
+    },
+    onFoxfireToggle(enabled: boolean): void {
+      setEngineFoxfire(enabled);
+      lastSnapshot = engine.getSnapshot();
+      ui.update(lastSnapshot, true);
     },
     onDrainSoil(): void {
       engine.drainSoil();
@@ -116,7 +137,7 @@ async function bootstrap(): Promise<void> {
   };
 
   const ui = new LabUI(appEl, callbacks);
-  ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused);
+  syncUiFromEngine();
 
   renderer = await TerrariumRenderer.create(ui.canvas);
   ui.setRendererBackend(renderer.backend);
@@ -147,11 +168,15 @@ async function bootstrap(): Promise<void> {
     },
     setSpecies: (id: SpeciesId) => {
       engine.setSpecies(id);
-      ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused);
+      syncUiFromEngine();
+      lastSnapshot = engine.getSnapshot();
+      ui.update(lastSnapshot, true);
     },
     setScene: (preset: TerrariumScenePreset) => {
       engine.setScene(preset);
-      ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused);
+      syncUiFromEngine();
+      lastSnapshot = engine.getSnapshot();
+      ui.update(lastSnapshot, true);
     },
     setView: (partial: Partial<ViewState>) => {
       ui.setViewState(partial);
@@ -161,10 +186,16 @@ async function bootstrap(): Promise<void> {
     },
     setEnv: (patch: Partial<EnvironmentState>) => {
       engine.setEnv(patch);
-      ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused);
+      syncUiFromEngine();
     },
     setLightingMood: (mood: LightingMood) => {
       ui.setLightingMood(mood);
+    },
+    setFoxfire: (enabled: boolean) => {
+      setEngineFoxfire(enabled);
+      ui.setFoxfire(enabled);
+      lastSnapshot = engine.getSnapshot();
+      ui.update(lastSnapshot, true);
     },
     stepSim: (dtSec: number, steps = 1) => {
       engine.stepFixed(dtSec, steps);
