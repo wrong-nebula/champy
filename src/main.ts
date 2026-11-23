@@ -14,7 +14,7 @@ import {
 } from './types/contract.ts';
 import { SimulationEngine } from './sim/engine.ts';
 import { TerrariumRenderer } from './render/TerrariumRenderer.ts';
-import { LabUI, type LabUICallbacks } from './ui/LabUI.ts';
+import { LabUI, type LabUICallbacks, type LightingMood } from './ui/LabUI.ts';
 
 interface SporocarpApi {
   getBackend(): 'webgpu' | 'webgl2';
@@ -23,6 +23,7 @@ interface SporocarpApi {
   setScene(preset: TerrariumScenePreset): void;
   setView(partial: Partial<ViewState>): void;
   setEnv(partial: Partial<EnvironmentState>): void;
+  setLightingMood(mood: LightingMood): void;
   stepSim(dtSec: number, steps?: number): void;
   pourRain(x: number, z: number, radius: number, depth: number): void;
   triggerFastForward(simSeconds: number): void;
@@ -74,6 +75,9 @@ async function bootstrap(): Promise<void> {
         engine.selectedBodyId = patch.selectedBodyId;
       }
     },
+    onLightingMoodChange(mood: LightingMood): void {
+      (renderer as unknown as { setLightingMood?: (m: LightingMood) => void })?.setLightingMood?.(mood);
+    },
     onDrainSoil(): void {
       engine.drainSoil();
     },
@@ -116,6 +120,9 @@ async function bootstrap(): Promise<void> {
 
   renderer = await TerrariumRenderer.create(ui.canvas);
   ui.setRendererBackend(renderer.backend);
+  (renderer as unknown as { setLightingMood?: (m: LightingMood) => void })?.setLightingMood?.(
+    ui.getLightingMood(),
+  );
 
   const syncCanvasSize = (): void => {
     if (!renderer) return;
@@ -157,6 +164,9 @@ async function bootstrap(): Promise<void> {
     setEnv: (patch: Partial<EnvironmentState>) => {
       engine.setEnv(patch);
       ui.syncState(engine.species.id, engine.scene, engine.env, engine.paused);
+    },
+    setLightingMood: (mood: LightingMood) => {
+      ui.setLightingMood(mood);
     },
     stepSim: (dtSec: number, steps = 1) => {
       engine.stepFixed(dtSec, steps);
