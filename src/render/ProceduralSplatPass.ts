@@ -74,7 +74,9 @@ function fbm2D(x: number, z: number): number {
 }
 
 function smoothstep(edge0: number, edge1: number, x: number): number {
-  const t = Math.max(0, Math.min(1, (x - edge0) / Math.max(1e-6, edge1 - edge0)));
+  const span = edge1 - edge0;
+  if (Math.abs(span) < 1e-6) return x >= edge1 ? 1 : 0;
+  const t = Math.max(0, Math.min(1, (x - edge0) / span));
   return t * t * (3 - 2 * t);
 }
 
@@ -391,8 +393,8 @@ fn cs_project_splats(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (mood >= 0.5 && mood < 1.5) {
       sunbeamTint = vec3<f32>(1.12, 0.95, 0.68);
     } else if (mood >= 1.5) {
-      sunbeamTint = vec3<f32>(1.16, 1.02, 0.84);
-      moodGain = 1.45;
+      sunbeamTint = vec3<f32>(1.14, 1.01, 0.85);
+      moodGain = 1.22;
     }
     let tyndall = sunbeamTint * (0.28 + 0.52 * forwardScatter) * mix(0.14, 1.0, shadow) * gobo;
     outCol = mix(ambientSmoke * 0.24, tyndall, clamp(0.32 + 0.50 * forwardScatter, 0.0, 0.90)) * moodGain;
@@ -407,10 +409,10 @@ fn cs_project_splats(@builtin(global_invocation_id) gid: vec3<u32>) {
     let shadow = evalSdfSoftShadow(pos, l);
     let glintSeed = s.colorMeta.r;
     let sporeLin = pow(max(u.sporePrintColor.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
-    let keyTint = mix(max(sporeLin * 1.35, vec3<f32>(0.34, 0.30, 0.25)), vec3<f32>(1.45, 1.34, 1.08), clamp(catchFactor * 0.58, 0.0, 0.88));
-    let moodGain = select(1.0, 1.55, mood >= 1.5);
-    outCol = keyTint * glintSeed * (0.45 + 0.62 * catchFactor) * mix(0.24, 1.0, shadow) * gobo * moodGain;
-    outAlpha = s.posAlpha.w * clamp(0.48 + 0.52 * catchFactor * mix(0.45, 1.0, shadow), 0.18, 0.86);
+    let keyTint = mix(max(sporeLin * 1.35, vec3<f32>(0.34, 0.30, 0.25)), vec3<f32>(1.40, 1.30, 1.06), clamp(catchFactor * 0.58, 0.0, 0.88));
+    let moodGain = select(1.0, 1.18, mood >= 1.5);
+    outCol = keyTint * glintSeed * (0.42 + 0.58 * catchFactor) * mix(0.22, 1.0, shadow) * gobo * moodGain;
+    outAlpha = s.posAlpha.w * clamp(0.45 + 0.52 * catchFactor * mix(0.40, 1.0, shadow), 0.14, 0.80);
   }
 
   // Quantize back-to-front 16-bit depth key in [0, 65534] so ascending sort orders far->near
@@ -1138,37 +1140,45 @@ export class ProceduralSplatPass {
 
         evalCurlDrift(px, py, pz, ageSec * 0.25 + (i & 31) * 0.07, curl);
 
+        // Smooth ceiling & upper-sky fade so backlit Dressaire cloud tapers into ethereal wisps before hitting glass top
+        const ceilingFade = smoothstep(0.295, 0.245, py);
+        if (ceilingFade <= 0.005) continue;
+        const upperGlintFade = smoothstep(0.30, 0.22, py);
+
         // (a) Ultra-fine sparkling airborne spore mote (0.38-0.50 mm diameter -> 0.19-0.25 mm Gaussian sigma)
         const moteR = 0.00019 + hash1(i * 41 + 3) * 0.00006;
         const moteStretch = moteR * (1.0 + Math.min(speed * 15.0, 1.35));
-        const moteAlpha = 0.28 + 0.22 * hash1(i * 41 + 5);
+        const sparkleTier = hash1(i * 41 + 9) > 0.72 ? 1.0 : 0.34;
+        const moteAlpha = (0.14 + 0.16 * hash1(i * 41 + 5)) * sparkleTier * ceilingFade * upperGlintFade;
         const glint = 0.78 + 0.48 * hash1(i * 41 + 7);
-        const qOffMote = this.pushSplat(
-          count++,
-          px, py, pz, moteAlpha,
-          moteStretch, moteR, moteR, 4,
-          glint, glint, glint, liftM,
-        );
-        if (speed > 1e-4) {
-          writeQuatFromDirX(d, qOffMote, vx, vy, vz);
-        } else {
-          d[qOffMote] = 0; d[qOffMote + 1] = 0; d[qOffMote + 2] = 0; d[qOffMote + 3] = 1;
+        if (moteAlpha > 0.005) {
+          const qOffMote = this.pushSplat(
+            count++,
+            px, py, pz, moteAlpha,
+            moteStretch, moteR, moteR, 4,
+            glint, glint, glint, liftM,
+          );
+          if (speed > 1e-4) {
+            writeQuatFromDirX(d, qOffMote, vx, vy, vz);
+          } else {
+            d[qOffMote] = 0; d[qOffMote + 1] = 0; d[qOffMote + 2] = 0; d[qOffMote + 3] = 1;
+          }
         }
 
-        // (b) Primary velocity-aligned & curl-drifted gossamer smoke wisp (1 in 3 spores, alpha 0.020-0.028)
+        // (b) Primary velocity-aligned & curl-drifted gossamer smoke wisp (every 2nd spore, silky stretched veil)
         //     Smoke fades up smoothly as spores disperse into the plume so dense newly-shed spores stay airy
-        const ageFade = Math.min(1, 0.22 + ageSec * 0.42);
-        if (i % 3 === 0 && count < MAX_SPLATS - 2) {
-          const lat1 = 0.0020 + hash1(i * 53 + 1) * 0.0012;
-          const stretch1 = Math.min(0.017, Math.max(lat1 * 2.8, 0.0062 + speed * 0.42));
-          const alpha1 = 0.020 + hash1(i * 53 + 2) * 0.008;
+        const ageFade = Math.min(1, 0.20 + ageSec * 0.40);
+        if ((i & 1) === 0 && count < MAX_SPLATS - 2) {
+          const lat1 = 0.0028 + hash1(i * 53 + 1) * 0.0014;
+          const stretch1 = Math.min(0.021, Math.max(lat1 * 3.0, 0.0082 + speed * 0.50));
+          const alpha1 = (0.018 + hash1(i * 53 + 2) * 0.006) * ceilingFade;
           const dx1 = vx + curl[0] * 0.018;
           const dy1 = vy + curl[1] * 0.016 + 0.003;
           const dz1 = vz + curl[2] * 0.018;
           const qOffSmoke1 = this.pushSplat(
             count++,
-            px + curl[0] * 0.0022, py + curl[1] * 0.0020, pz + curl[2] * 0.0022, alpha1,
-            stretch1, lat1, lat1 * 0.86, 3,
+            px + curl[0] * 0.0024, py + curl[1] * 0.0022, pz + curl[2] * 0.0024, alpha1,
+            stretch1, lat1, lat1 * 0.88, 3,
             1, ageFade, speed, liftM,
           );
           if (Math.hypot(dx1, dy1, dz1) > 1e-5) {
@@ -1178,18 +1188,18 @@ export class ProceduralSplatPass {
           }
         }
 
-        // (c) Broad curl-noise-drifted gossamer veil lobe (1 in 7 spores, alpha 0.018-0.024)
-        if (i % 7 === 0 && count < MAX_SPLATS) {
-          const lat2 = 0.0038 + hash1(i * 67 + 1) * 0.0018;
-          const stretch2 = Math.min(0.023, Math.max(lat2 * 3.0, 0.011 + speed * 0.55));
-          const alpha2 = 0.018 + hash1(i * 67 + 3) * 0.006;
+        // (c) Broad curl-noise-drifted gossamer veil lobe (1 in 5 spores, alpha 0.018-0.022)
+        if (i % 5 === 0 && count < MAX_SPLATS) {
+          const lat2 = 0.0052 + hash1(i * 67 + 1) * 0.0024;
+          const stretch2 = Math.min(0.028, Math.max(lat2 * 3.2, 0.013 + speed * 0.65));
+          const alpha2 = (0.018 + hash1(i * 67 + 3) * 0.004) * ceilingFade;
           const dx2 = vx + curl[0] * 0.028;
           const dy2 = vy + curl[1] * 0.024 + 0.005;
           const dz2 = vz + curl[2] * 0.028;
           const qOffSmoke2 = this.pushSplat(
             count++,
-            px + curl[0] * 0.0052, py + curl[1] * 0.0044 + 0.001, pz + curl[2] * 0.0052, alpha2,
-            stretch2, lat2, lat2 * (0.78 + 0.22 * hash1(i * 67 + 2)), 3,
+            px + curl[0] * 0.0056, py + curl[1] * 0.0046 + 0.001, pz + curl[2] * 0.0056, alpha2,
+            stretch2, lat2, lat2 * (0.80 + 0.20 * hash1(i * 67 + 2)), 3,
             1, ageFade, speed, liftM,
           );
           if (Math.hypot(dx2, dy2, dz2) > 1e-5) {
