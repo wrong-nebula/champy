@@ -26,9 +26,10 @@ struct SceneUniforms {
   camRight: vec4<f32>,        // xyz = camera right, w = viewportWidthPx
   camUp: vec4<f32>,           // xyz = camera up, w = viewportHeightPx
   lightViewProj: mat4x4<f32>, // directional 2048x2048 shadow matrix
-  speciesExtra: vec4<f32>,  // x = speciesIdx (0..3), y = shadowEnabled, z = near, w = far
+  speciesExtra: vec4<f32>,  // x = speciesIdx (0..4), y = shadowEnabled, z = near, w = far
   postParams: vec4<f32>,    // x = focusDistM, y = dofStrength, z = bloomStrength, w = rimStrength
   padExtra: vec4<f32>,
+  biolumInfo: vec4<f32>,    // x = biolumIntensity 0..2.5, y = nocturnalFactor 0..1, z = meanO2Factor, w = circadianFactor
 };
 
 fn isClippedBySlice(p: vec3<f32>, sliceParams: vec4<f32>) -> bool {
@@ -377,13 +378,20 @@ fn fs_main(in: BackVertOut) -> @location(0) vec4<f32> {
   let centerBacklit = vec3<f32>(0.018, 0.022, 0.030);
   let spotGlow = exp(-d * d * 4.4);
 
+  // 3: Deep midnight forest indigo nocturnal gradient
+  let edgeNocturnal = vec3<f32>(0.002, 0.004, 0.009);
+  let centerNocturnal = vec3<f32>(0.008, 0.018, 0.032);
+
+  let isNocturnal = smoothstep(2.4, 2.9, mood);
   let isCanopy = smoothstep(0.5, 1.0, mood) * (1.0 - smoothstep(1.2, 1.8, mood));
-  let isBacklit = smoothstep(1.2, 1.8, mood);
+  let isBacklit = smoothstep(1.2, 1.8, mood) * (1.0 - isNocturnal);
 
   var edge = mix(edgeStudio, edgeCanopy, isCanopy);
   edge = mix(edge, edgeBacklit, isBacklit);
+  edge = mix(edge, edgeNocturnal, isNocturnal);
   var center = mix(centerStudio, centerCanopy, isCanopy);
   center = mix(center, centerBacklit, isBacklit);
+  center = mix(center, centerNocturnal, isNocturnal);
 
   let g = mix(glow, spotGlow, isBacklit);
   return vec4<f32>(mix(edge, center, g), 1.0);
@@ -513,7 +521,10 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
     let ndl = max(dot(n, l), 0.0);
     let spec = pow(max(dot(n, h), 0.0), 48.0) * 0.06;
     let base = srgbToLinear(vec3<f32>(0.055, 0.072, 0.095));
-    return vec4<f32>(base * (0.45 + 0.75 * ndl) + vec3<f32>(spec), 1.0);
+    let noctPlinth = max(clamp(u.biolumInfo.y, 0.0, 1.0), smoothstep(2.4, 2.9, u.padExtra.x));
+    let moonTint = mix(vec3<f32>(1.0), vec3<f32>(0.42, 0.56, 0.86), noctPlinth);
+    let plinthCol = (base * (0.45 + 0.75 * ndl) + vec3<f32>(spec)) * moonTint * mix(1.0, 0.09, noctPlinth);
+    return vec4<f32>(plinthCol, 1.0);
   }
 
   let isSlice = in.flags > 0.5;
@@ -693,16 +704,21 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
 
     let gobo = select(1.0, evalCanopyGobo(in.worldPos, l, u.padExtra), isTop);
     let mood = u.padExtra.x;
+    let noct = max(clamp(u.biolumInfo.y, 0.0, 1.0), smoothstep(2.4, 2.9, mood));
     let isCanopyMood = smoothstep(0.5, 1.0, mood) * (1.0 - smoothstep(1.2, 1.8, mood));
-    let isBacklitMood = smoothstep(1.2, 1.8, mood);
+    let isBacklitMood = smoothstep(1.2, 1.8, mood) * (1.0 - smoothstep(2.4, 2.9, mood));
 
-    let skyScale = mix(1.0, 0.38, isBacklitMood);
+    let skyScale = mix(mix(1.0, 0.38, isBacklitMood), 0.07, noct);
     let skyFloor = select(vec3<f32>(0.032, 0.038, 0.044), vec3<f32>(0.062, 0.068, 0.078), !isTop);
-    let sky = mix(skyFloor, vec3<f32>(0.13, 0.16, 0.21), bentN.y * 0.5 + 0.5) * skyScale;
-    let sunTint = mix(vec3<f32>(0.96, 0.90, 0.80), vec3<f32>(1.04, 0.88, 0.62), isCanopyMood);
+    let skyDay = mix(skyFloor, vec3<f32>(0.13, 0.16, 0.21), bentN.y * 0.5 + 0.5);
+    let skyMoon = mix(vec3<f32>(0.015, 0.022, 0.048), vec3<f32>(0.055, 0.085, 0.165), bentN.y * 0.5 + 0.5);
+    let sky = mix(skyDay, skyMoon, noct) * skyScale;
+    let sunBase = mix(vec3<f32>(0.96, 0.90, 0.80), vec3<f32>(1.04, 0.88, 0.62), isCanopyMood);
+    let sunTint = mix(sunBase, vec3<f32>(0.36, 0.48, 0.78), noct) * mix(1.0, 0.07, noct);
     let sun = sunTint * ndl * mix(0.22, 1.0, shadow) * gobo;
-    let rimLight = pow(1.0 - max(dot(bumpedN, v), 0.0), 3.2) * u.postParams.w * 0.04;
-    let wetSpec = pow(max(dot(bumpedN, h), 0.0), 42.0) * wetness * 0.14 * (1.0 - stoneFrac) * shadow * sdfAo * gobo;
+    let rimLight = pow(1.0 - max(dot(bumpedN, v), 0.0), 3.2) * u.postParams.w * 0.04 * mix(1.0, 0.12, noct);
+    let specDim = mix(1.0, 0.08, noct);
+    let wetSpec = pow(max(dot(bumpedN, h), 0.0), 42.0) * wetness * 0.14 * (1.0 - stoneFrac) * shadow * sdfAo * gobo * specDim;
 
     // Tiny glinting quartz grit flecks in sand / silt-loam / granite
     let qFrac = clamp(wMat[0] + wMat[1] * 0.55 + wMat[5] * 0.70, 0.0, 1.0);
@@ -714,16 +730,20 @@ fn fs_main(in: SoilVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
       let qSeed = hash31(qId);
       let qSpark = step(0.952, qSeed) * (1.0 - smoothstep(0.05, 0.18, qVor.x));
       let qFacetN = normalize(bumpedN + (hash33(qId) - vec3<f32>(0.5)) * 1.15);
-      quartzGlint = pow(max(dot(qFacetN, h), 0.0), 96.0) * qSpark * qFrac * 0.85 * shadow * sdfAo * gobo;
+      quartzGlint = pow(max(dot(qFacetN, h), 0.0), 96.0) * qSpark * qFrac * 0.85 * shadow * sdfAo * gobo * specDim;
     }
 
-    // Wet soil IBL reflection sheen on surface & meniscus
+    // Wet soil IBL reflection sheen on surface & meniscus (plus emerald GI catchlight at night)
     let wetIblMask = select(meniscus * 0.72, smoothstep(0.26, 0.86, wetness) * (1.0 - stoneFrac * 0.5), isTop);
     let soilRefl = reflect(-v, bumpedN);
     let soilFresnel = 0.02 + 0.98 * pow(1.0 - max(dot(bumpedN, v), 0.0), 5.0);
-    let wetIbl = evalStudioIbl(soilRefl, mix(0.62, 0.16, wetness), u.padExtra.w) * soilFresnel * wetIblMask * 0.55 * mix(0.35, 1.0, sdfAo);
+    let wetIbl = evalStudioIbl(soilRefl, mix(0.62, 0.16, wetness), u.padExtra.w)
+      * soilFresnel * wetIblMask * 0.55 * mix(0.35, 1.0, sdfAo)
+      * mix(vec3<f32>(1.0), vec3<f32>(0.36, 0.48, 0.80) * 0.08, noct);
+    let giWeight = mix(0.50, 1.25, noct);
+    let wetGiSheen = gi * soilFresnel * wetIblMask * 0.12 * noct;
 
-    color = albedo * ((sky + sun) * sdfAo + gi * 0.50 + vec3<f32>(rimLight)) * depthAo + vec3<f32>(wetSpec + quartzGlint) + wetIbl;
+    color = albedo * ((sky + sun) * sdfAo + gi * giWeight + vec3<f32>(rimLight)) * depthAo + vec3<f32>(wetSpec + quartzGlint) + wetIbl + wetGiSheen;
   } else {
     let hemi = 0.14 + 0.10 * (bumpedN.y * 0.5 + 0.5);
     let wetSpec = pow(max(dot(bumpedN, h), 0.0), 36.0) * wetness * 0.08 * (1.0 - stoneFrac);
@@ -833,6 +853,7 @@ fn fs_main(in: MycVertOut) -> @location(0) vec4<f32> {
   if (xrayMode == 3) {
     col = colormapViridis(in.turgorNorm) * (0.52 + 0.58 * cylShade);
   } else {
+    let noct = max(clamp(u.biolumInfo.y, 0.0, 1.0), smoothstep(2.4, 2.9, u.padExtra.x));
     let dryHypha = srgbToLinear(vec3<f32>(0.40, 0.31, 0.21));
     let turgidHypha = srgbToLinear(vec3<f32>(0.97, 0.90, 0.75));
     let glowTip = srgbToLinear(vec3<f32>(1.04, 0.83, 0.40));
@@ -843,6 +864,15 @@ fn fs_main(in: MycVertOut) -> @location(0) vec4<f32> {
       // Stronger subterranean depth-cued warmth toward deep amber earth tone
       let deepWarm = col * vec3<f32>(0.54, 0.30, 0.14);
       col = mix(deepWarm, col * vec3<f32>(1.04, 0.96, 0.84), depthCue);
+    }
+    col *= mix(vec3<f32>(1.0), vec3<f32>(0.11, 0.15, 0.22), noct);
+
+    if (xrayMode == 0 && u.biolumInfo.x > 0.001) {
+      let o2Factor = clamp(u.biolumInfo.z, 0.0, 1.0);
+      let metabolic = smoothstep(0.14, 0.86, in.turgorNorm) * (0.45 + 0.55 * cylShade);
+      let foxfireAmp = u.biolumInfo.x * mix(0.22, 1.85, noct) * o2Factor;
+      let depthFade = select(1.0, mix(0.35, 1.0, depthCue), isSubterranean);
+      col += vec3<f32>(0.045, 0.98, 0.22) * (metabolic * foxfireAmp * depthFade);
     }
   }
 
@@ -1005,6 +1035,25 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
       sheenColor = srgbToLinear(vec3<f32>(1.0, 0.84, 0.36));
       specPower = 26.0;
       specStrength = 0.06;
+    } else if (speciesIdx == 4) {
+      // Mycena chlorophos: delicate translucent celadon cap striations & radial bell flutes
+      let fluteWave = sin(theta * 24.0 + bSeed);
+      let fluteMask = smoothstep(0.16, 0.92, rNorm);
+      let umboShade = smoothstep(0.32, 0.04, rNorm);
+      let celadonCenter = srgbToLinear(vec3<f32>(0.54, 0.68, 0.56));
+      let celadonEdge = srgbToLinear(vec3<f32>(0.84, 0.94, 0.85));
+      let ridgeCol = srgbToLinear(vec3<f32>(0.91, 0.98, 0.89));
+      let grooveCol = srgbToLinear(vec3<f32>(0.62, 0.78, 0.66));
+      var capCol = mix(celadonEdge, celadonCenter, umboShade * 0.70);
+      capCol = mix(capCol, mix(grooveCol, ridgeCol, 0.5 + 0.5 * fluteWave), fluteMask * 0.58);
+      albedo = capCol * (0.94 + 0.12 * micro);
+      let tanDir = vec3<f32>(-sin(theta), 0.0, cos(theta));
+      bumpVec += tanDir * (cos(theta * 24.0 + bSeed) * fluteMask * 0.20);
+      specPower = 56.0;
+      specStrength = 0.15;
+      sheenStrength = 0.10;
+      sheenRough = 0.36;
+      sheenColor = srgbToLinear(vec3<f32>(0.86, 0.98, 0.88));
     } else {
       // Shaggy Ink Cap: vertical fibrous scales + deliquescing black wet margin
       let fiber = valueNoise3D(vec3<f32>(cos(theta) * 18.0, relY * 180.0, sin(theta) * 18.0) + vec3<f32>(bSeed));
@@ -1022,17 +1071,26 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
     sheenStrength = 0.16;
     sheenRough = 0.44;
     sheenColor = srgbToLinear(vec3<f32>(1.0, 0.82, 0.34));
+  } else if (partId == 2 && speciesIdx == 4) {
+    // Mycena translucent celadon hymenium gills
+    sheenStrength = 0.14;
+    sheenRough = 0.38;
+    sheenColor = srgbToLinear(vec3<f32>(0.78, 0.98, 0.82));
   } else if (partId == 0) {
     // Stipe vertical fibrous micro-striation
     let stipeFib = valueNoise3D(vec3<f32>(in.worldPos.x * 180.0, relY * 45.0, in.worldPos.z * 180.0));
     albedo *= 0.90 + 0.18 * stipeFib;
+    if (speciesIdx == 4) {
+      albedo = mix(albedo, srgbToLinear(vec3<f32>(0.84, 0.95, 0.86)), smoothstep(0.35, 1.0, relY) * 0.45);
+    }
     sheenStrength = 0.07;
     sheenRough = 0.55;
     sheenColor = srgbToLinear(vec3<f32>(0.92, 0.88, 0.82));
   }
 
   if (!frontFacing) {
-    albedo = mix(albedo, srgbToLinear(vec3<f32>(0.90, 0.85, 0.76)), 0.60);
+    let backTint = select(vec3<f32>(0.90, 0.85, 0.76), vec3<f32>(0.78, 0.94, 0.80), speciesIdx == 4);
+    albedo = mix(albedo, srgbToLinear(backTint), 0.60);
   }
 
   let nLit = normalize(n - bumpVec);
@@ -1058,25 +1116,30 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
 
   let gobo = evalCanopyGobo(in.worldPos, l, u.padExtra);
   let mood = u.padExtra.x;
+  let noct = max(clamp(u.biolumInfo.y, 0.0, 1.0), smoothstep(2.4, 2.9, mood));
   let isCanopyMood = smoothstep(0.5, 1.0, mood) * (1.0 - smoothstep(1.2, 1.8, mood));
-  let isBacklitMood = smoothstep(1.2, 1.8, mood);
+  let isBacklitMood = smoothstep(1.2, 1.8, mood) * (1.0 - smoothstep(2.4, 2.9, mood));
 
-  // 3-Point Studio Macro Botanical Lighting + IBL + Charlie Sheen + Dual-Lobe Specular + Thickness SSS
+  // 3-Point Studio Macro Botanical Lighting + IBL + Charlie Sheen + Dual-Lobe Specular + Thickness SSS + Nocturnal Moonlight
   let wrapNdl = clamp((dot(nLit, l) + 0.22) / 1.22, 0.0, 1.0);
-  let sunTint = mix(vec3<f32>(0.94, 0.88, 0.76), vec3<f32>(1.06, 0.87, 0.60), isCanopyMood);
+  let sunBase = mix(vec3<f32>(0.94, 0.88, 0.76), vec3<f32>(1.06, 0.87, 0.60), isCanopyMood);
+  let sunTint = mix(sunBase, vec3<f32>(0.36, 0.48, 0.78), noct) * mix(1.0, 0.07, noct);
   let sunTerm = sunTint * wrapNdl * mix(0.18, 1.0, shadow) * gobo;
-  let skyScale = mix(1.0, 0.32, isBacklitMood);
-  let skyFill = mix(vec3<f32>(0.025, 0.030, 0.038), vec3<f32>(0.10, 0.13, 0.18), bentN.y * 0.5 + 0.5) * skyScale;
+  let skyScale = mix(mix(1.0, 0.32, isBacklitMood), 0.09, noct);
+  let skyDay = mix(vec3<f32>(0.025, 0.030, 0.038), vec3<f32>(0.10, 0.13, 0.18), bentN.y * 0.5 + 0.5);
+  let skyMoon = mix(vec3<f32>(0.015, 0.022, 0.048), vec3<f32>(0.055, 0.088, 0.168), bentN.y * 0.5 + 0.5);
+  let skyFill = mix(skyDay, skyMoon, noct) * skyScale;
 
   let ndv = max(dot(nLit, v), 0.0);
   let fresnel = pow(1.0 - ndv, 3.0);
   let rimBack = max(0.25, dot(-v, l) * 0.5 + 0.5);
   let rimBoost = mix(1.0, 2.15, isBacklitMood);
-  let rimLight = vec3<f32>(0.88, 0.76, 0.60) * fresnel * rimBack * 0.14 * u.postParams.w * rimBoost * totalAo;
+  let rimTint = mix(vec3<f32>(0.88, 0.76, 0.60), vec3<f32>(0.36, 0.50, 0.82), noct);
+  let rimLight = rimTint * fresnel * rimBack * 0.14 * u.postParams.w * rimBoost * totalAo * mix(1.0, 0.16, noct);
 
   // Velvety Charlie microfiber sheen
   let charlie = evalCharlieSheen(ndv, sheenRough);
-  let sheen = sheenColor * charlie * sheenStrength * (0.35 + 0.65 * wrapNdl) * totalAo;
+  let sheen = sheenColor * charlie * sheenStrength * (0.35 + 0.65 * wrapNdl) * totalAo * mix(1.0, 0.10, noct);
 
   // Thickness-modulated backlit waxy chitin SSS (dramatically amplified in Dark-Field Backlit mood)
   let backDot = clamp(dot(v, -l + nLit * 0.38), 0.0, 1.0);
@@ -1084,20 +1147,22 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
   let capThin = mix(0.38, 0.96, smoothstep(0.18, 0.96, rNorm));
   let thicknessFactor = select(select(capThin, 1.05, partId == 2 || partId == 3), 0.34, partId == 0);
   let sssBoost = mix(1.0, 2.85, isBacklitMood);
-  let sss = srgbToLinear(u.sssColor.rgb) * backLight * 0.42 * thicknessFactor * sssBoost * (0.35 + 0.65 * shadow) * mix(0.55, 1.0, gobo);
+  let sss = srgbToLinear(u.sssColor.rgb) * backLight * 0.42 * thicknessFactor * sssBoost * (0.35 + 0.65 * shadow) * mix(0.55, 1.0, gobo) * mix(1.0, 0.08, noct);
 
   // Dual-lobe specular + Studio IBL environment reflections
   let ndh = max(dot(nLit, h), 0.0);
   let broadSpec = pow(ndh, specPower) * specStrength;
   let coatSpec = pow(ndh, specPower * 3.2) * (specStrength * 0.55);
-  let spec = (broadSpec + coatSpec) * shadow * sdfAo * gobo;
+  let specDim = mix(1.0, 0.08, noct);
+  let specCol = vec3<f32>((broadSpec + coatSpec) * shadow * sdfAo * gobo) * mix(vec3<f32>(1.0), vec3<f32>(0.42, 0.58, 0.92), noct) * specDim;
 
   let cutRoughness = clamp(1.0 - sqrt(specPower) / 11.0, 0.14, 0.86);
   let fSchlick = vec3<f32>(0.035) + vec3<f32>(0.965) * pow(1.0 - ndv, 5.0);
-  let iblRefl = evalStudioIbl(reflect(-v, nLit), cutRoughness, u.padExtra.w) * fSchlick * mix(0.28, 1.0, totalAo);
+  let iblRefl = evalStudioIbl(reflect(-v, nLit), cutRoughness, u.padExtra.w) * fSchlick * mix(0.28, 1.0, totalAo) * mix(vec3<f32>(1.0), vec3<f32>(0.35, 0.48, 0.82) * 0.08, noct);
   let iblDiff = evalStudioIbl(bentN, 0.95, u.padExtra.w) * 0.16 * skyScale * totalAo;
 
-  var color = albedo * ((skyFill + iblDiff + sunTerm) * totalAo + gi * 0.48) + sss + sheen + vec3<f32>(spec) + iblRefl + rimLight;
+  let giWeight = mix(0.48, 1.25, noct);
+  var color = albedo * ((skyFill + iblDiff + sunTerm) * totalAo + gi * giWeight) + sss + sheen + specCol + iblRefl + rimLight;
 
   // High-RH micro-water dewdrops clustered delicately near cap margins with sharp clearcoat glint
   let rhDew = smoothstep(0.80, 0.96, clamp(u.soilDims.w, 0.0, 1.0));
@@ -1119,11 +1184,37 @@ fn fs_main(in: MushVertOut, @builtin(front_facing) frontFacing: bool) -> @locati
       let dGz = (dVorZ - dewVor.x) / epsD;
       let dewN = normalize(nLit + (dt1 * dGx + dt2 * dGz) * 0.0020);
       let dewFresnel = 0.02 + 0.98 * pow(1.0 - max(dot(dewN, v), 0.0), 5.0);
-      let dewSpec = pow(max(dot(dewN, h), 0.0), 220.0) * 1.45 * shadow * sdfAo * gobo;
-      let dewIbl = evalStudioIbl(reflect(-v, dewN), 0.03, u.padExtra.w) * dewFresnel * 1.15;
+      let dewSpec = pow(max(dot(dewN, h), 0.0), 220.0) * 1.45 * shadow * sdfAo * gobo * specDim;
+      let dewIbl = (evalStudioIbl(reflect(-v, dewN), 0.03, u.padExtra.w) * mix(vec3<f32>(1.0), vec3<f32>(0.36, 0.50, 0.85) * 0.10, noct) + gi * 0.55 * noct) * dewFresnel * 1.15;
       let dewRim = smoothstep(0.18, 0.25, dewVor.x) * dewCluster * marginBand * rhDew;
       color = mix(color * (1.0 - 0.16 * dewRim), color * 0.88 + dewIbl + vec3<f32>(dewSpec), clamp(dewDrop * 1.15, 0.0, 1.0));
     }
+  }
+
+  // Real narrowband 525 nm fungal bioluminescence (Mycena gills/fluted margin/stipe; never over X-Ray modes)
+  if (xrayMode == 0 && u.biolumInfo.x > 0.001) {
+    let biolumCol525 = vec3<f32>(0.045, 0.98, 0.22);
+    let glow = u.biolumInfo.x * mix(0.18, 1.75, noct);
+    var emitMask = 0.0;
+    if (partId == 2) {
+      // Brightest on underside gills with subtle radial structure
+      emitMask = 1.35 * mix(0.84, 1.08, 0.5 + 0.5 * sin(theta * 24.0 + bSeed));
+    } else if (partId == 1) {
+      // Glowing along translucent fluted thin cap margin
+      let marginGlow = smoothstep(0.15, 0.95, rNorm);
+      let fluteMod = select(
+        0.92 + 0.08 * sin(theta * 24.0 + bSeed),
+        0.72 + 0.38 * (0.5 + 0.5 * sin(theta * 24.0 + bSeed)),
+        speciesIdx == 4,
+      );
+      emitMask = mix(0.14, 0.96, marginGlow) * fluteMod;
+    } else if (partId == 0) {
+      // Subtle translucent glow gradient on upper stipe beneath the gills
+      emitMask = mix(0.06, 0.62, smoothstep(0.35, 1.0, relY));
+    } else {
+      emitMask = 0.48;
+    }
+    color += biolumCol525 * (emitMask * glow);
   }
 
   let alpha = select(1.0, 0.86, partId == 3);
@@ -1169,20 +1260,22 @@ fn vs_main(v: SolidVertIn) -> SolidVertOut {
 fn fs_main(in: SolidVertOut) -> @location(0) vec4<f32> {
   let nLen = length(in.worldNormal);
   if (nLen < 0.05) {
-    let lineFade = select(1.0, 0.38, u.padExtra.x > 1.5);
+    let lineFade = select(1.0, select(0.38, 0.26, u.padExtra.x > 2.5), u.padExtra.x > 1.5);
     return vec4<f32>(in.color.rgb, in.color.a * lineFade);
   }
 
   let n = in.worldNormal / nLen;
   let l = normalize(u.lightDir.xyz);
   let v = normalize(u.cameraPos.xyz - in.worldPos);
+  let noct = max(clamp(u.biolumInfo.y, 0.0, 1.0), smoothstep(2.4, 2.9, u.padExtra.x));
 
   // Translucent museum glass pane + genuine studio softbox IBL reflection + live RH condensation
   if (in.color.a < 0.95) {
     let xrayMode = i32(floor(u.soilBoundsMax.w + 0.5));
     let nView = select(-n, n, dot(n, v) >= 0.0);
     let glassRefl = reflect(-v, nView);
-    let glassIbl = evalStudioIbl(glassRefl, 0.06, u.padExtra.w);
+    let glassIbl = evalStudioIbl(glassRefl, 0.06, u.padExtra.w)
+      * mix(vec3<f32>(1.0), vec3<f32>(0.34, 0.48, 0.82) * 0.14, noct);
     let fresnel = 0.04 + 0.96 * pow(1.0 - abs(dot(n, v)), 3.4);
     let rh = clamp(u.soilDims.w, 0.0, 1.0);
     let rhMist = select(0.0, smoothstep(0.72, 0.98, rh), xrayMode == 0);
@@ -1191,11 +1284,14 @@ fn fs_main(in: SolidVertOut) -> @location(0) vec4<f32> {
     let droplet = (1.0 - smoothstep(0.08, 0.30, dropNoise.x)) * rhMist * hBand;
     let meniscus = (1.0 - smoothstep(0.0, 0.008, abs(in.worldPos.y))) * select(0.02, 0.08, xrayMode == 0);
 
+    let giGlass = select(vec3<f32>(0.0), evalSdfGI(in.worldPos * 0.90, nView, nView), xrayMode == 0 && noct > 0.01);
     let iblScale = select(0.16, 0.68, xrayMode == 0);
-    let dropCol = vec3<f32>(0.42, 0.56, 0.72) * droplet * 0.18 + glassIbl * droplet * 0.32;
-    let col = srgbToLinear(in.color.rgb)
-      + srgbToLinear(vec3<f32>(0.55, 0.72, 0.88)) * fresnel * select(0.16, 0.30, xrayMode == 0)
+    let dropCol = (vec3<f32>(0.42, 0.56, 0.72) * mix(1.0, 0.14, noct) + giGlass * 1.10 * noct) * droplet * 0.18
+      + (glassIbl + giGlass * 0.55 * noct) * droplet * 0.32;
+    let col = srgbToLinear(in.color.rgb) * mix(1.0, 0.18, noct)
+      + srgbToLinear(vec3<f32>(0.55, 0.72, 0.88)) * mix(vec3<f32>(1.0), vec3<f32>(0.28, 0.42, 0.76) * 0.22, noct) * fresnel * select(0.16, 0.30, xrayMode == 0)
       + glassIbl * fresnel * iblScale
+      + giGlass * fresnel * 0.22 * noct
       + dropCol;
     let baseA = select(in.color.a * 0.45, in.color.a, xrayMode == 0);
     let alpha = clamp(baseA + fresnel * 0.13 + droplet * 0.055 + meniscus, 0.0, 0.42);
@@ -1209,10 +1305,15 @@ fn fs_main(in: SolidVertOut) -> @location(0) vec4<f32> {
   let gi = evalSdfGI(in.worldPos + n * 0.006, n, aoBent.xyz);
   let gobo = evalCanopyGobo(in.worldPos, l, u.padExtra);
 
-  let hemi = 0.08 + 0.08 * (aoBent.y * 0.5 + 0.5);
+  let hemiDay = 0.08 + 0.08 * (aoBent.y * 0.5 + 0.5);
+  let hemiMoon = vec3<f32>(0.015, 0.022, 0.048) + vec3<f32>(0.035, 0.055, 0.115) * (aoBent.y * 0.5 + 0.5);
+  let hemi = mix(vec3<f32>(hemiDay), hemiMoon, noct) * mix(1.0, 0.12, noct);
+  let sunTint = mix(vec3<f32>(1.0), vec3<f32>(0.36, 0.48, 0.78), noct) * mix(1.0, 0.07, noct);
   let albedo = srgbToLinear(in.color.rgb);
-  let iblBounce = evalStudioIbl(reflect(-v, n), 0.74, u.padExtra.w) * 0.045 * aoBent.w;
-  let col = albedo * (0.86 + 0.28 * grain) * ((hemi + 0.92 * ndl * mix(0.22, 1.0, shadow) * gobo) * aoBent.w + gi * 0.48) + iblBounce;
+  let iblBounce = evalStudioIbl(reflect(-v, n), 0.74, u.padExtra.w) * 0.045 * aoBent.w
+    * mix(vec3<f32>(1.0), vec3<f32>(0.35, 0.48, 0.80) * 0.09, noct);
+  let giWeight = mix(0.48, 1.25, noct);
+  let col = albedo * (0.86 + 0.28 * grain) * ((hemi + sunTint * 0.92 * ndl * mix(0.22, 1.0, shadow) * gobo) * aoBent.w + gi * giWeight) + iblBounce;
   return vec4<f32>(col, 1.0);
 }
 `;

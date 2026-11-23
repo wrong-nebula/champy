@@ -19,7 +19,7 @@ import {
 import { MicroscopeCanvas } from './MicroscopeCanvas.ts';
 import { TelemetryPlots } from './TelemetryPlots.ts';
 
-export type LightingMood = 'studio' | 'canopy' | 'backlit';
+export type LightingMood = 'studio' | 'canopy' | 'backlit' | 'nocturnal';
 
 export interface LabUICallbacks {
   onSpeciesChange(speciesId: SpeciesId): void;
@@ -30,6 +30,7 @@ export interface LabUICallbacks {
   onEnvChange(patch: Partial<EnvironmentState>): void;
   onViewChange(patch: Partial<ViewState>): void;
   onLightingMoodChange?(mood: LightingMood): void;
+  onFoxfireToggle?(enabled: boolean): void;
   onDrainSoil(): void;
   onFloodSoil(): void;
   onCanvasPick(clientX: number, clientY: number): PickResult;
@@ -102,7 +103,16 @@ const LIGHTING_MOOD_DEFS: { id: LightingMood; label: string; title: string }[] =
   { id: 'studio', label: 'Studio', title: 'Neutral botanical softbox & studio IBL' },
   { id: 'canopy', label: 'Canopy', title: 'Warm dappled woodland sun & drifting foliage gobo' },
   { id: 'backlit', label: 'Backlit', title: 'Dark-field obsidian spotlight & strong subsurface glow' },
+  { id: 'nocturnal', label: 'Night', title: 'Nocturnal Bioluminescence Moonlight' },
 ];
+
+function formatPhotonFlux(flux: number): string {
+  if (!Number.isFinite(flux) || flux <= 0) return '0';
+  if (flux < 1000) return `${flux.toFixed(0)}`;
+  const exp = Math.floor(Math.log10(flux));
+  const mant = flux / Math.pow(10, exp);
+  return `${mant.toFixed(1)}e${exp}`;
+}
 
 function formatSimClock(simSec: number): string {
   if (simSec < 120) return `${simSec.toFixed(1)} s`;
@@ -134,6 +144,8 @@ export class LabUI {
   private activeTool: BrushTool = 'orbit';
   private paused = false;
   private currentMood: LightingMood = 'studio';
+  private currentSpeciesId: SpeciesId = 'parasol';
+  private foxfireEnabled = false;
   private viewState: ViewState = {
     cameraYaw: 0.62,
     cameraPitch: 0.42,
@@ -183,6 +195,7 @@ export class LabUI {
   private layerMycBtn!: HTMLButtonElement;
   private layerSporeBtn!: HTMLButtonElement;
   private layerWindBtn!: HTMLButtonElement;
+  private layerFoxfireBtn!: HTMLButtonElement;
   private moodBtns = new Map<LightingMood, HTMLButtonElement>();
 
   private sliceCheck!: HTMLInputElement;
@@ -207,6 +220,10 @@ export class LabUI {
   private kpiLoopsEl!: HTMLDivElement;
   private kpiCapsEl!: HTMLDivElement;
   private kpiLiftEl!: HTMLDivElement;
+  private biolumBarEl!: HTMLDivElement;
+  private biolumFluxValEl!: HTMLSpanElement;
+  private biolumO2ValEl!: HTMLSpanElement;
+  private biolumCircValEl!: HTMLSpanElement;
   private captionEl!: HTMLDivElement;
 
   private boundListeners: Array<() => void> = [];
@@ -264,7 +281,7 @@ export class LabUI {
     // Species preset buttons
     const spGroup = document.createElement('div');
     spGroup.className = 'sp-segment-group';
-    const speciesOrder: SpeciesId[] = ['parasol', 'chanterelle', 'morel', 'inkcap'];
+    const speciesOrder: SpeciesId[] = ['parasol', 'chanterelle', 'morel', 'inkcap', 'mycena'];
     const shortNames: Record<SpeciesId, string> = {
       parasol: 'Parasol',
       chanterelle: 'Chanterelle',
@@ -277,6 +294,7 @@ export class LabUI {
       btn.type = 'button';
       btn.className = 'sp-btn' + (sid === 'parasol' ? ' active' : '');
       btn.textContent = shortNames[sid];
+      btn.title = SPECIES_PRESETS[sid].name;
       btn.dataset.species = sid;
       this.addListener(btn, 'click', () => {
         this.setActiveSpeciesButton(sid);
@@ -546,23 +564,32 @@ export class LabUI {
     const pills = document.createElement('div');
     pills.className = 'sp-layer-pills';
 
-    const mkLayer = (label: string, initial: boolean, onToggle: (next: boolean) => void) => {
+    const mkLayer = (label: string, layerId: string, initial: boolean, onToggle: (next: boolean) => void) => {
       const b = document.createElement('button');
       b.type = 'button';
       b.className = 'sp-btn' + (initial ? ' active' : '');
       b.textContent = label;
+      b.dataset.layer = layerId;
+      b.setAttribute('aria-pressed', String(initial));
       this.addListener(b, 'click', () => {
         const next = !b.classList.contains('active');
         b.classList.toggle('active', next);
+        b.setAttribute('aria-pressed', String(next));
         onToggle(next);
       });
       pills.appendChild(b);
       return b;
     };
 
-    this.layerMycBtn = mkLayer('Mycelium', true, (v) => this.emitViewPatch({ showMycelium: v }));
-    this.layerSporeBtn = mkLayer('Spores', true, (v) => this.emitViewPatch({ showSpores: v }));
-    this.layerWindBtn = mkLayer('Plume', true, (v) => this.emitViewPatch({ showStreamlines: v }));
+    this.layerMycBtn = mkLayer('Mycelium', 'mycelium', true, (v) => this.emitViewPatch({ showMycelium: v }));
+    this.layerSporeBtn = mkLayer('Spores', 'spores', true, (v) => this.emitViewPatch({ showSpores: v }));
+    this.layerWindBtn = mkLayer('Plume', 'plume', true, (v) => this.emitViewPatch({ showStreamlines: v }));
+    this.layerFoxfireBtn = mkLayer('Foxfire', 'foxfire', false, (v) => {
+      this.foxfireEnabled = v;
+      this.syncBiolumToggleDOM();
+      this.callbacks.onFoxfireToggle?.(v);
+    });
+    this.layerFoxfireBtn.title = 'Toggle 525 nm Foxfire Bioluminescence';
     layerSec.appendChild(pills);
     dock.appendChild(layerSec);
 
@@ -759,6 +786,34 @@ export class LabUI {
     this.kpiLiftEl = mkKpi('Lift');
     telSec.appendChild(kpiGrid);
 
+    // 525 nm Bioluminescence telemetry readout strip (revealed when active)
+    this.biolumBarEl = document.createElement('div');
+    this.biolumBarEl.className = 'sp-biolum-bar hidden';
+    const bioHead = document.createElement('div');
+    bioHead.className = 'sp-biolum-head';
+    bioHead.innerHTML = `<span class="sp-biolum-title"><span class="sp-biolum-dot"></span>525 nm Bioluminescence</span><span>LH₂ · O₂</span>`;
+    const bioRow = document.createElement('div');
+    bioRow.className = 'sp-biolum-row';
+
+    const mkBioMetric = (prefix: string, init: string): HTMLSpanElement => {
+      const wrap = document.createElement('span');
+      wrap.className = 'sp-biolum-metric';
+      const lbl = document.createElement('b');
+      lbl.textContent = prefix + ' ';
+      const val = document.createElement('span');
+      val.textContent = init;
+      wrap.appendChild(lbl);
+      wrap.appendChild(val);
+      bioRow.appendChild(wrap);
+      return val;
+    };
+    this.biolumFluxValEl = mkBioMetric('FLUX', '0 ph/cm²·s');
+    this.biolumO2ValEl = mkBioMetric('O₂', '0%');
+    this.biolumCircValEl = mkBioMetric('CIRCADIAN', '0% · Night');
+    this.biolumBarEl.appendChild(bioHead);
+    this.biolumBarEl.appendChild(bioRow);
+    telSec.appendChild(this.biolumBarEl);
+
     const plotCard = document.createElement('div');
     plotCard.className = 'sp-canvas-card';
     const retCanvas = document.createElement('canvas');
@@ -872,6 +927,7 @@ export class LabUI {
   }
 
   private setActiveSpeciesButton(speciesId: SpeciesId): void {
+    this.currentSpeciesId = speciesId;
     for (const [id, btn] of this.speciesBtns) {
       btn.classList.toggle('active', id === speciesId);
     }
@@ -879,6 +935,7 @@ export class LabUI {
     if (preset && this.captionEl) {
       this.captionEl.innerHTML = `<strong>${preset.name}</strong> <em>${preset.scientificName}</em>`;
     }
+    this.syncBiolumToggleDOM();
   }
 
   setBrushTool(tool: BrushTool): void {
@@ -909,12 +966,27 @@ export class LabUI {
   }
 
   setLightingMood(mood: LightingMood): void {
-    if (mood !== 'studio' && mood !== 'canopy' && mood !== 'backlit') {
+    if (mood !== 'studio' && mood !== 'canopy' && mood !== 'backlit' && mood !== 'nocturnal') {
       return;
     }
     this.currentMood = mood;
     this.syncMoodDOM();
     this.callbacks.onLightingMoodChange?.(mood);
+  }
+
+  setFoxfire(enabled: boolean): void {
+    this.foxfireEnabled = enabled;
+    this.syncBiolumToggleDOM();
+  }
+
+  private syncBiolumToggleDOM(snapshotActive?: boolean): void {
+    if (!this.layerFoxfireBtn) return;
+    const active =
+      typeof snapshotActive === 'boolean'
+        ? snapshotActive
+        : this.foxfireEnabled || this.currentSpeciesId === 'mycena';
+    this.layerFoxfireBtn.classList.toggle('active', active);
+    this.layerFoxfireBtn.setAttribute('aria-pressed', String(active));
   }
 
   private syncMoodDOM(): void {
@@ -930,7 +1002,11 @@ export class LabUI {
     scene: TerrariumScenePreset,
     env: EnvironmentState,
     paused?: boolean,
+    foxfireEnabled?: boolean,
   ): void {
+    if (typeof foxfireEnabled === 'boolean') {
+      this.foxfireEnabled = foxfireEnabled;
+    }
     this.setActiveSpeciesButton(speciesId);
     this.sceneSelect.value = scene;
 
@@ -979,6 +1055,7 @@ export class LabUI {
     this.layerMycBtn.classList.toggle('active', v.showMycelium);
     this.layerSporeBtn.classList.toggle('active', v.showSpores);
     this.layerWindBtn.classList.toggle('active', v.showStreamlines);
+    this.syncBiolumToggleDOM();
     this.syncMoodDOM();
 
     for (const [id, btn] of this.xrayBtns) {
@@ -999,13 +1076,13 @@ export class LabUI {
     }
   }
 
-  update(snapshot: SimulationSnapshot): void {
+  update(snapshot: SimulationSnapshot, force = false): void {
     // Always animate the 1,000x Buller's Drop microscope smoothly at 60 FPS
     this.microscope.render(snapshot.bullerMicro);
 
     // Update live text/plots at ~15 Hz to keep DOM layout cost negligible while remaining crisp
     const now = performance.now();
-    if (now - this.lastFrameUiTime < 60 && this.lastFrameUiTime > 0) {
+    if (!force && now - this.lastFrameUiTime < 60 && this.lastFrameUiTime > 0) {
       return;
     }
     this.lastFrameUiTime = now;
@@ -1018,6 +1095,34 @@ export class LabUI {
     this.kpiLoopsEl.textContent = String(tel.anastomosisCount);
     this.kpiCapsEl.textContent = String(tel.fruitingCount);
     this.kpiLiftEl.textContent = `${(tel.maxSporeLiftM * 1000).toFixed(1)}mm`;
+
+    const b = snapshot.biolum;
+    const biolumActive = b
+      ? b.enabled || snapshot.species.id === 'mycena'
+      : this.foxfireEnabled || snapshot.species.id === 'mycena';
+    this.syncBiolumToggleDOM(biolumActive);
+
+    if (!biolumActive) {
+      this.biolumBarEl.classList.add('hidden');
+    } else {
+      this.biolumBarEl.classList.remove('hidden');
+      const o2Ratio = b
+        ? b.meanO2Factor
+        : Math.max(0, Math.min(1, tel.meanSoilO2MolM3 / (1.6 + tel.meanSoilO2MolM3)));
+      const phase01 = b
+        ? b.circadianPhase01
+        : ((((snapshot.simTimeSec - 27000) % 86400) + 86400) % 86400) / 86400;
+      const circFactor = b
+        ? b.circadianFactor
+        : 0.22 + 0.78 * Math.pow(0.5 * (1 - Math.cos(2 * Math.PI * phase01)), 1.4);
+      const phaseLabel = circFactor >= 0.52 ? 'Night' : 'Day';
+      const flux = b ? b.photonFluxCm2S : 0;
+
+      this.biolumFluxValEl.textContent = b ? `${formatPhotonFlux(flux)} ph/cm²·s` : '— ph/cm²·s';
+      this.biolumO2ValEl.textContent = `${Math.round(o2Ratio * 100)}%`;
+      this.biolumCircValEl.textContent = `${Math.round(circFactor * 100)}% · ${phaseLabel}`;
+      this.biolumBarEl.classList.toggle('quenched', Boolean(b && flux <= 0));
+    }
 
     this.microHeaderEl.textContent = snapshot.bullerMicro.speciesName || snapshot.species.name;
     this.telemetryPlots.render(snapshot);

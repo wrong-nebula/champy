@@ -16,6 +16,8 @@ export const SDF_NZ = 64;
 
 /** Maximum analytical scene primitives packed per frame (stipe segments + caps + obstacles) */
 const MAX_PRIMS = 192;
+/** Maximum 525 nm bioluminescent emitters packed per frame */
+const MAX_BIOLUM_LIGHTS = 32;
 /** 12 floats (48 bytes) per primitive:
  *  a: vec4(ax, ay, az, radiusA)
  *  b: vec4(bx, by, bz, kind)       kind: 0=capsule, 1=capDome, 2=capFunnel, 3=capMorel, 4=sphere
@@ -34,11 +36,12 @@ export interface SdfVolumeBounds {
 
 const BAKE_SDF_WGSL = /* wgsl */ `
 struct SdfUniforms {
-  volMin: vec4<f32>,    // xyz = min, w = primCount
-  volMax: vec4<f32>,    // xyz = max, w = voxelSize
-  lightDir: vec4<f32>,  // xyz = normalized lightDir, w = sliceEnabled
-  soilCol: vec4<f32>,   // rgb = mean forest floor albedo, w = sliceAxis (0=x,1=z)
-  sliceInfo: vec4<f32>, // x = sliceWorldCoord, y = soilHalfX, z = soilHalfZ, w = ambientHumidity
+  volMin: vec4<f32>,       // xyz = min, w = primCount
+  volMax: vec4<f32>,       // xyz = max, w = voxelSize
+  lightDir: vec4<f32>,     // xyz = normalized lightDir, w = sliceEnabled
+  soilCol: vec4<f32>,      // rgb = mean forest floor albedo, w = sliceAxis (0=x,1=z)
+  sliceInfo: vec4<f32>,    // x = sliceWorldCoord, y = soilHalfX, z = soilHalfZ, w = ambientHumidity
+  biolumParams: vec4<f32>, // x = ambientLightScale, y = emitterCount, z = biolumGain, w = nocturnalFactor
 };
 
 struct SdfPrim {
@@ -160,12 +163,14 @@ struct SdfUniforms {
   lightDir: vec4<f32>,
   soilCol: vec4<f32>,
   sliceInfo: vec4<f32>,
+  biolumParams: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: SdfUniforms;
 @group(0) @binding(1) var sdfTex: texture_3d<f32>;
 @group(0) @binding(2) var linearSamp: sampler;
 @group(0) @binding(3) var radOut: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(4) var<storage, read> biolumLights: array<vec4<f32>>;
 
 fn worldToUvw(p: vec3<f32>) -> vec3<f32> {
   return (p - u.volMin.xyz) / max(u.volMax.xyz - u.volMin.xyz, vec3<f32>(1e-4));
@@ -219,10 +224,39 @@ fn cs_inject_bounce1(@builtin(global_invocation_id) gid: vec3<u32>) {
   let d = s.x;
   let albedo = s.yzw;
 
-  if (abs(d) > voxelSize * 2.2) {
+  if (d < -voxelSize * 3.0) {
+    textureStore(radOut, vec3<i32>(gid), vec4<f32>(0.0));
+    return;
+  }
+
+  let emitterCount = min(u32(max(u.biolumParams.y + 0.5, 0.0)), 32u);
+  let biolumGain = max(u.biolumParams.z, 0.0);
+  let biolumColor = vec3<f32>(0.055, 0.96, 0.22);
+  var biolumRad = vec3<f32>(0.0);
+  if (emitterCount > 0u && biolumGain > 0.001) {
+    for (var i = 0u; i < emitterCount; i = i + 1u) {
+      let em = biolumLights[i];
+      let flux = em.w;
+      if (flux <= 0.0001) {
+        continue;
+      }
+      let delta = em.xyz - p;
+      let dist2 = dot(delta, delta);
+      var vis = 1.0;
+      if (dist2 > 0.0020) {
+        let midD = sampleSdf(mix(p, em.xyz, 0.45)).x;
+        vis = mix(0.18, 1.0, smoothstep(-voxelSize * 1.8, voxelSize * 0.6, midD));
+      }
+      let atten = (flux * 0.0022) / (dist2 + 0.0012);
+      biolumRad += biolumColor * (atten * vis * biolumGain);
+    }
+  }
+
+  let ambientScale = u.biolumParams.x;
+  if (d > voxelSize * 3.0) {
     let sky = mix(vec3<f32>(0.04, 0.05, 0.065), vec3<f32>(0.11, 0.14, 0.19), clamp(uvw.y, 0.0, 1.0));
-    let w = select(0.0, 0.18, d > 0.0);
-    textureStore(radOut, vec3<i32>(gid), vec4<f32>(sky * w, 0.0));
+    let radAir = sky * (0.18 * ambientScale) + biolumRad * 0.65;
+    textureStore(radOut, vec3<i32>(gid), vec4<f32>(radAir, 0.0));
     return;
   }
 
@@ -232,8 +266,9 @@ fn cs_inject_bounce1(@builtin(global_invocation_id) gid: vec3<u32>) {
   let sh = select(0.08, sdfSoftShadow(p + n * voxelSize * 0.65, l, voxelSize), ndl > 0.01);
   let sunCol = vec3<f32>(1.28, 1.20, 1.06);
   let skyCol = vec3<f32>(0.22, 0.27, 0.34) * (0.45 + 0.55 * max(n.y, 0.0));
-  let directRad = albedo * (sunCol * ndl * sh + skyCol);
-  let density = smoothstep(voxelSize * 2.2, 0.0, abs(d));
+  let directRad = albedo * (sunCol * ndl * sh + skyCol) * ambientScale
+    + biolumRad * (vec3<f32>(0.65) + albedo * 0.55);
+  let density = smoothstep(voxelSize * 3.0, 0.0, abs(d));
   textureStore(radOut, vec3<i32>(gid), vec4<f32>(directRad, density));
 }
 `;
@@ -245,6 +280,7 @@ struct SdfUniforms {
   lightDir: vec4<f32>,
   soilCol: vec4<f32>,
   sliceInfo: vec4<f32>,
+  biolumParams: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: SdfUniforms;
@@ -310,6 +346,7 @@ export class FastSdfGiSystem {
 
   private uniformBuf: GPUBuffer;
   private primBuf: GPUBuffer;
+  private biolumLightsBuf: GPUBuffer;
   private linearSampler: GPUSampler;
 
   private bakePipe: GPUComputePipeline;
@@ -320,8 +357,9 @@ export class FastSdfGiSystem {
   private bounce1BindGroup: GPUBindGroup;
   private bounce2BindGroup: GPUBindGroup;
 
-  private uniformScratch = new Float32Array(20);
+  private uniformScratch = new Float32Array(24);
   private primScratch = new Float32Array(MAX_PRIMS * FLOATS_PER_PRIM);
+  private biolumLightsScratch = new Float32Array(MAX_BIOLUM_LIGHTS * 4);
   readonly bounds: SdfVolumeBounds = {
     minX: -0.26,
     minY: -0.05,
@@ -363,11 +401,15 @@ export class FastSdfGiSystem {
     this.radViewB = this.radTexB.createView({ dimension: '3d' });
 
     this.uniformBuf = device.createBuffer({
-      size: 80,
+      size: 96,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.primBuf = device.createBuffer({
       size: MAX_PRIMS * FLOATS_PER_PRIM * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.biolumLightsBuf = device.createBuffer({
+      size: MAX_BIOLUM_LIGHTS * 16,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
@@ -407,6 +449,7 @@ export class FastSdfGiSystem {
         { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '3d' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
         { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '3d' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       ],
     });
     this.bounce1Pipe = device.createComputePipeline({
@@ -420,6 +463,7 @@ export class FastSdfGiSystem {
         { binding: 1, resource: this.sdfView },
         { binding: 2, resource: this.linearSampler },
         { binding: 3, resource: this.radViewA },
+        { binding: 4, resource: { buffer: this.biolumLightsBuf } },
       ],
     });
 
@@ -456,6 +500,7 @@ export class FastSdfGiSystem {
     view: ViewState,
     lightDir: [number, number, number],
     sliceWorldCoord: number,
+    lightingMoodIdx = 0,
   ): void {
     const soilHalfX = snapshot.soil.sizeX * 0.5;
     const soilHalfZ = snapshot.soil.sizeZ * 0.5;
@@ -539,6 +584,23 @@ export class FastSdfGiSystem {
       }
     }
 
+    const emitters = snapshot.biolum?.enabled ? snapshot.biolum.emitters : null;
+    const emitterCount = emitters ? Math.min(MAX_BIOLUM_LIGHTS, emitters.length) : 0;
+    const nocturnalFactor = lightingMoodIdx === 3 ? 1.0 : 0.0;
+    const ambientLightScale =
+      lightingMoodIdx === 3 ? 0.06 : lightingMoodIdx === 2 ? 0.38 : 1.0;
+    const biolumGain = snapshot.biolum?.enabled ? (snapshot.species.biolumGain ?? 1.0) : 0.0;
+
+    const lArr = this.biolumLightsScratch;
+    for (let i = 0; i < emitterCount; i++) {
+      const em = emitters![i];
+      const o = i * 4;
+      lArr[o] = em.x;
+      lArr[o + 1] = em.y;
+      lArr[o + 2] = em.z;
+      lArr[o + 3] = Math.max(0, em.intensity);
+    }
+
     const voxelSize = (this.bounds.maxX - this.bounds.minX) / SDF_NX;
     const u = this.uniformScratch;
     u[0] = this.bounds.minX;
@@ -561,8 +623,12 @@ export class FastSdfGiSystem {
     u[17] = soilHalfX;
     u[18] = soilHalfZ;
     u[19] = snapshot.env.ambientHumidity;
+    u[20] = ambientLightScale;
+    u[21] = emitterCount;
+    u[22] = biolumGain;
+    u[23] = nocturnalFactor;
 
-    this.device.queue.writeBuffer(this.uniformBuf, 0, u.buffer, u.byteOffset, 80);
+    this.device.queue.writeBuffer(this.uniformBuf, 0, u.buffer, u.byteOffset, 96);
     if (count > 0) {
       this.device.queue.writeBuffer(
         this.primBuf,
@@ -570,6 +636,15 @@ export class FastSdfGiSystem {
         p.buffer,
         p.byteOffset,
         count * FLOATS_PER_PRIM * 4,
+      );
+    }
+    if (emitterCount > 0) {
+      this.device.queue.writeBuffer(
+        this.biolumLightsBuf,
+        0,
+        lArr.buffer,
+        lArr.byteOffset,
+        emitterCount * 16,
       );
     }
 
@@ -602,5 +677,6 @@ export class FastSdfGiSystem {
     this.radTexB.destroy();
     this.uniformBuf.destroy();
     this.primBuf.destroy();
+    this.biolumLightsBuf.destroy();
   }
 }

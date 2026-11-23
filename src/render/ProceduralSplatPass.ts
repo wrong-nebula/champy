@@ -351,6 +351,9 @@ fn cs_project_splats(@builtin(global_invocation_id) gid: vec3<u32>) {
   let l = normalize(u.lightDir.xyz);
   let v = normalize(u.cameraPos.xyz - pos);
   let mood = u.padExtra.x;
+  let isNocturnal = smoothstep(2.4, 2.9, mood);
+  let isCanopy = mood >= 0.5 && mood < 1.5;
+  let isBacklit = mood >= 1.5 && mood < 2.45;
   let gobo = evalSplatGobo(pos, l, u.padExtra);
   var outCol = s.colorMeta.rgb;
   var outAlpha = s.posAlpha.w;
@@ -364,55 +367,75 @@ fn cs_project_splats(@builtin(global_invocation_id) gid: vec3<u32>) {
     let shadow = evalSdfSoftShadow(probePos, l);
     let gi = evalSdfGI(probePos, nProbe, aoBent.xyz);
     let ndl = clamp((dot(nProbe, l) + 0.35) / 1.35, 0.0, 1.0);
-    let skyGain = select(1.0, 0.58, mood >= 1.5);
-    let sky = mix(vec3<f32>(0.030, 0.036, 0.042), vec3<f32>(0.10, 0.13, 0.18), aoBent.y * 0.5 + 0.5) * skyGain;
-    let sunTint = select(vec3<f32>(0.94, 0.88, 0.76), vec3<f32>(1.04, 0.90, 0.66), mood >= 0.5 && mood < 1.5);
-    let sun = sunTint * ndl * mix(0.22, 1.0, shadow) * gobo;
+    let skyGain = select(1.0, 0.58, isBacklit);
+    let skyDay = mix(vec3<f32>(0.030, 0.036, 0.042), vec3<f32>(0.10, 0.13, 0.18), aoBent.y * 0.5 + 0.5) * skyGain;
+    let moonSky = vec3<f32>(0.015, 0.025, 0.045) * (0.72 + 0.28 * (aoBent.y * 0.5 + 0.5));
+    let sky = mix(skyDay, moonSky, isNocturnal);
+    let sunTint = select(vec3<f32>(0.94, 0.88, 0.76), vec3<f32>(1.04, 0.90, 0.66), isCanopy);
+    let sunDay = sunTint * ndl * mix(0.22, 1.0, shadow) * gobo;
+    let sun = mix(sunDay, sunDay * vec3<f32>(0.72, 0.84, 1.05) * 0.07, isNocturnal);
+    let giGain = mix(0.48, 1.35, isNocturnal);
     let baseLin = pow(max(s.colorMeta.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
-    let lit = baseLin * ((sky + sun) * aoBent.w + gi * 0.48);
+    let lit = baseLin * ((sky + sun) * aoBent.w + gi * giGain);
     outCol = lit;
   } else if (kind == 1) {
-    // Cottony mycelial halo (linear HDR)
+    // Cottony mycelial halo (linear HDR; 525 nm emerald foxfire when bioluminescence is active)
     if (xrayMode == 3) {
       outCol = colormapViridis(s.colorMeta.w);
     } else {
-      outCol = pow(max(s.colorMeta.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)) * 0.85;
+      let rawLin = pow(max(s.colorMeta.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)) * 0.85;
+      let foxfireMask = clamp((s.colorMeta.g - s.colorMeta.r) * 2.5, 0.0, 1.0);
+      let noctScale = mix(1.0, mix(0.16, 1.55, foxfireMask), isNocturnal);
+      outCol = rawLin * noctScale;
     }
   } else if (kind == 3) {
-    // Broad multi-scale gossamer volumetric smoke (Henyey-Greenstein forward scattering + Tyndall sunbeam tint)
+    // Broad multi-scale gossamer volumetric smoke (Henyey-Greenstein forward scattering + Tyndall sunbeam tint + Nocturnal GI)
     let cosTheta = clamp(dot(v, -l), -1.0, 1.0);
     let hg = phaseHG(cosTheta, 0.58);
     let forwardScatter = clamp(hg * 0.24, 0.10, 1.85);
     let shadow = evalSdfSoftShadow(pos, l);
+    let gi = evalSdfGI(pos + vec3<f32>(0.0, 0.01, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
     let lifted = clamp(s.colorMeta.w / 0.03, 0.0, 1.0);
     let ageFade = clamp(s.colorMeta.g, 0.18, 1.0);
     let sporeLin = pow(max(u.sporePrintColor.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
     let ambientSmoke = mix(max(sporeLin * 0.90, vec3<f32>(0.15, 0.14, 0.13)), vec3<f32>(0.24, 0.36, 0.48), lifted * 0.36);
     var sunbeamTint = vec3<f32>(1.02, 0.92, 0.76);
     var moodGain = 1.0;
-    if (mood >= 0.5 && mood < 1.5) {
+    if (isCanopy) {
       sunbeamTint = vec3<f32>(1.12, 0.95, 0.68);
-    } else if (mood >= 1.5) {
+    } else if (isBacklit) {
       sunbeamTint = vec3<f32>(1.14, 1.01, 0.85);
       moodGain = 1.22;
     }
     let tyndall = sunbeamTint * (0.28 + 0.52 * forwardScatter) * mix(0.14, 1.0, shadow) * gobo;
-    outCol = mix(ambientSmoke * 0.24, tyndall, clamp(0.32 + 0.50 * forwardScatter, 0.0, 0.90)) * moodGain;
-    // Prevent dense freshly-released spores in deep under-cap shadow from forming an opaque milky cloud
-    outAlpha = s.posAlpha.w * ageFade * mix(0.30, 1.0, shadow);
+    let dayCol = mix(ambientSmoke * 0.24, tyndall, clamp(0.32 + 0.50 * forwardScatter, 0.0, 0.90)) * moodGain;
+    let moonSmoke = mix(vec3<f32>(0.012, 0.020, 0.036), vec3<f32>(0.032, 0.052, 0.088), clamp(0.25 + 0.55 * forwardScatter, 0.0, 1.0)) * mix(0.30, 1.0, shadow);
+    let noctCol = moonSmoke + gi * 2.2;
+    outCol = mix(dayCol, noctCol, isNocturnal);
+    // Prevent dense freshly-released spores in deep under-cap shadow from forming an opaque milky cloud,
+    // while keeping bioluminescence-lit wisps glowing above caps in Nocturnal
+    let giVis = clamp(length(gi) * 2.5, 0.0, 1.0);
+    let shadowAlpha = mix(mix(0.30, 1.0, shadow), mix(0.45, 1.0, max(shadow, giVis)), isNocturnal);
+    outAlpha = s.posAlpha.w * ageFade * shadowAlpha;
   } else {
-    // Ultra-fine sparkling airborne spore mote (0.38-0.50 mm glint catching forward-scattered key/rim light)
+    // Ultra-fine sparkling airborne spore mote (0.38-0.50 mm glint catching forward-scattered key/rim light + Nocturnal GI)
     let cosTheta = clamp(dot(v, -l), -1.0, 1.0);
     let hgGlint = phaseHG(cosTheta, 0.68);
     let rimCatch = pow(1.0 - abs(dot(v, vec3<f32>(0.0, 1.0, 0.0))), 2.2) * 0.35;
     let catchFactor = clamp(hgGlint * 0.32 + rimCatch, 0.15, 2.2);
     let shadow = evalSdfSoftShadow(pos, l);
+    let gi = evalSdfGI(pos + vec3<f32>(0.0, 0.01, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
     let glintSeed = s.colorMeta.r;
     let sporeLin = pow(max(u.sporePrintColor.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
     let keyTint = mix(max(sporeLin * 1.35, vec3<f32>(0.34, 0.30, 0.25)), vec3<f32>(1.40, 1.30, 1.06), clamp(catchFactor * 0.58, 0.0, 0.88));
-    let moodGain = select(1.0, 1.18, mood >= 1.5);
-    outCol = keyTint * glintSeed * (0.42 + 0.58 * catchFactor) * mix(0.22, 1.0, shadow) * gobo * moodGain;
-    outAlpha = s.posAlpha.w * clamp(0.45 + 0.52 * catchFactor * mix(0.40, 1.0, shadow), 0.14, 0.80);
+    let moodGain = select(1.0, 1.18, isBacklit);
+    let dayCol = keyTint * glintSeed * (0.42 + 0.58 * catchFactor) * mix(0.22, 1.0, shadow) * gobo * moodGain;
+    let moonMote = vec3<f32>(0.06, 0.10, 0.17) * glintSeed * (0.38 + 0.62 * catchFactor) * mix(0.22, 1.0, shadow);
+    let noctCol = moonMote + gi * 2.2 * glintSeed;
+    outCol = mix(dayCol, noctCol, isNocturnal);
+    let giVis = clamp(length(gi) * 3.0, 0.0, 1.0);
+    let shadowTerm = mix(shadow, max(shadow, giVis), isNocturnal);
+    outAlpha = s.posAlpha.w * clamp(0.45 + 0.52 * catchFactor * mix(0.40, 1.0, shadowTerm), 0.14, 0.80);
   }
 
   // Quantize back-to-front 16-bit depth key in [0, 65534] so ascending sort orders far->near
@@ -1019,6 +1042,18 @@ export class ProceduralSplatPass {
       const segCount = Math.min(snapshot.mycelium.segmentCount, Math.floor(segs.length / 8));
       const maxEnd = this.soilSplatCount + MAX_MYC_SPLATS;
       const stride = segCount > MAX_MYC_SPLATS / 2 ? 2 : 1;
+      const biolum = snapshot.biolum;
+      const biolumEnabled = Boolean(biolum?.enabled);
+      const biolumGlow = biolumEnabled && biolum
+        ? Math.max(0, Math.min(1.3,
+          biolum.luciferinPoolNorm * biolum.meanO2Factor * biolum.circadianFactor * 1.15,
+        ))
+        : 0;
+      const soil = snapshot.soil;
+      const halfX = soil.sizeX * 0.5;
+      const halfZ = soil.sizeZ * 0.5;
+      const invDx = 1 / soil.dx;
+
       for (let i = 0; i < segCount && count < maxEnd - 2; i += stride) {
         const s8 = i * 8;
         const ax = segs[s8], ay = segs[s8 + 1], az = segs[s8 + 2];
@@ -1034,14 +1069,41 @@ export class ProceduralSplatPass {
         const my = (ay + by) * 0.5;
         const mz = (az + bz) * 0.5;
 
-        const cr = 0.46 + 0.44 * turgor;
-        const cg = 0.40 + 0.40 * turgor;
-        const cb = 0.28 + 0.34 * turgor;
-        const rVis = Math.max(0.0007, Math.min(0.0018, rad * 4.2));
+        let cr = 0.46 + 0.44 * turgor;
+        let cg = 0.40 + 0.40 * turgor;
+        let cb = 0.28 + 0.34 * turgor;
+        let rVis = Math.max(0.0007, Math.min(0.0018, rad * 4.2));
+        let alpha = 0.10 + 0.10 * turgor;
+
+        if (biolumEnabled && biolumGlow > 1e-4) {
+          const fx = Math.floor((mx + halfX) * invDx);
+          const fy = Math.floor((my + soil.sizeY) * invDx);
+          const fz = Math.floor((mz + halfZ) * invDx);
+          const ix = fx < 0 ? 0 : fx >= soil.nx ? soil.nx - 1 : fx;
+          const iy = fy < 0 ? 0 : fy >= soil.ny ? soil.ny - 1 : fy;
+          const iz = fz < 0 ? 0 : fz >= soil.nz ? soil.nz - 1 : fz;
+          const vIdx = soil.voxelIndex(ix, iy, iz);
+          const isWood = soil.material[vIdx] === SoilMaterialId.WOOD;
+          const localO2 = soil.o2[vIdx];
+          const localO2Factor = localO2 <= 0 ? 0 : Math.min(1.0, localO2 / (1.6 + localO2) / 0.845);
+          const woodBoost = isWood ? 1.28 : 1.0;
+          const segGlow = Math.min(1.3, biolumGlow * (0.45 + 0.55 * turgor) * (0.20 + 0.80 * localO2Factor) * woodBoost);
+          const mixT = Math.min(1.0, segGlow);
+          // Physical 525 nm emerald foxfire vec3(0.10, 0.96, 0.28) mixed with warm ivory
+          cr = cr * (1 - mixT) + 0.10 * mixT;
+          cg = cg * (1 - mixT) + 0.96 * mixT;
+          cb = cb * (1 - mixT) + 0.28 * mixT;
+          const colBoost = 1.0 + segGlow * (isWood ? 0.50 : 0.28);
+          cr *= colBoost;
+          cg *= colBoost;
+          cb *= colBoost;
+          alpha *= 1.0 + segGlow * (isWood ? 0.95 : 0.55);
+          rVis *= 1.0 + segGlow * (isWood ? 0.42 : 0.25);
+        }
 
         const qOff = this.pushSplat(
           count++,
-          mx, my, mz, 0.10 + 0.10 * turgor,
+          mx, my, mz, alpha,
           segLen * 0.42, rVis, rVis, 1,
           cr, cg, cb, turgor,
         );

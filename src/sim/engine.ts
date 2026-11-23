@@ -19,6 +19,7 @@ import { SoilGrid } from './soil/SoilGrid.ts';
 import { MyceliumNetwork } from './mycelium/MyceliumNetwork.ts';
 import { MorphogenesisSystem } from './morpho/MorphogenesisSystem.ts';
 import { SporePhysicsSystem } from './spores/SporePhysicsSystem.ts';
+import { BioluminescenceSystem } from './biolum/BioluminescenceSystem.ts';
 
 /** Maximum macro (soil / mycelium / morphogenesis) step — conservative vs. tested 300 s. */
 const MACRO_DT_MAX_S = 600;
@@ -56,6 +57,8 @@ export class SimulationEngine {
   mycelium: MyceliumNetwork;
   morpho: MorphogenesisSystem;
   spores: SporePhysicsSystem;
+  public foxfireEnabled = false;
+  public readonly biolum = new BioluminescenceSystem();
   species: SpeciesPreset;
   scene: TerrariumScenePreset;
   env: EnvironmentState = defaultEnvironment();
@@ -94,6 +97,20 @@ export class SimulationEngine {
     this.spores = new SporePhysicsSystem(this.bounds);
     this.syncSoilAmbient();
     this.inoculate();
+    this.refreshBiolum();
+  }
+
+  private refreshBiolum(): void {
+    this.biolum.step(
+      0,
+      this.simTimeSec,
+      this.env,
+      this.species,
+      this.soil,
+      this.mycelium,
+      this.morpho.getBodies(),
+      this.foxfireEnabled,
+    );
   }
 
   // --- configuration ------------------------------------------------------
@@ -132,12 +149,16 @@ export class SimulationEngine {
     this.mycelium = new MyceliumNetwork(this.soil, this.species);
     this.morpho.reset(this.species);
     this.spores.reset();
+    this.biolum.reset();
     this.selectedBodyId = -1;
     this.macroAccumS = 0;
     this.historyAccumS = 0;
     this.history = [];
     this.simTimeSec = 0;
     this.inoculate();
+    if ((this.species.biolumGain ?? 0) > 0 || this.foxfireEnabled) {
+      this.refreshBiolum();
+    }
   }
 
   reset(): void {
@@ -146,12 +167,20 @@ export class SimulationEngine {
     this.resetBiology();
   }
 
+  setFoxfireEnabled(enabled: boolean): void {
+    this.foxfireEnabled = enabled;
+    this.refreshBiolum();
+  }
+
   setEnv(patch: Partial<EnvironmentState>): void {
     Object.assign(this.env, patch);
     if (patch.terrainTiltRad !== undefined && patch.gravityDir === undefined) {
       this.env.gravityDir = gravityFromTilt(this.env.terrainTiltRad);
     }
     this.env.timeWarp = Math.max(1, Math.min(100000, this.env.timeWarp));
+    if (patch.ambientTempC !== undefined) {
+      this.refreshBiolum();
+    }
   }
 
   drainSoil(): void {
@@ -255,6 +284,7 @@ export class SimulationEngine {
     for (let i = 0; i < 90; i++) {
       this.spores.step(1 / 24, this.morpho.getBodies(), this.env, this.env.evaporationEnabled);
     }
+    this.refreshBiolum();
   }
 
   private macroStep(dt: number): void {
@@ -267,6 +297,16 @@ export class SimulationEngine {
     this.simTimeSec += dt;
     this.morpho.syncWithPrimordia(this.mycelium, this.simTimeSec);
     this.morpho.step(dt, this.mycelium, this.env, this.obstacles);
+    this.biolum.step(
+      dt,
+      this.simTimeSec,
+      this.env,
+      this.species,
+      this.soil,
+      this.mycelium,
+      this.morpho.getBodies(),
+      this.foxfireEnabled,
+    );
 
     this.historyAccumS += dt;
     if (this.historyAccumS >= HISTORY_PERIOD_S) {
@@ -351,6 +391,7 @@ export class SimulationEngine {
       spores: this.spores.getSpores(),
       sporePrint: this.spores.getSporePrint(),
       bullerMicro: this.spores.getActiveBullerState(microIdx),
+      biolum: this.biolum.getState(),
       telemetry,
       telemetryHistory: [...this.history, telemetry],
     };
