@@ -44,11 +44,12 @@ import {
   SOLID_WGSL,
   SPORE_GLSL_FS,
   SPORE_GLSL_VS,
-  SPORE_WGSL,
   STREAMLINE_GLSL_FS,
   STREAMLINE_GLSL_VS,
   STREAMLINE_WGSL,
 } from './shaders.ts';
+import { FastSdfGiSystem, SDF_NX, type SdfVolumeBounds } from './FastSdfGi.ts';
+import { ProceduralSplatPass } from './ProceduralSplatPass.ts';
 
 export type RendererBackend = 'webgpu' | 'webgl2';
 
@@ -186,15 +187,13 @@ function buildSoilAndSliceMesh(
   o = appendQuad(out, o, [px1, py0, pz1], [px1, py0, pz0], [px1, py1, pz0], [px1, py1, pz1], [1, 0, 0], 2);
   o = appendQuad(out, o, [px0, py0, pz0], [px0, py0, pz1], [px0, py1, pz1], [px0, py1, pz0], [-1, 0, 0], 2);
 
-  // Dynamic Razor Slice cross-section face (flag = 1)
+  // Dynamic Razor Slice cross-section face (flag = 1; single quad prevents coplanar Z-fighting)
   if (view.sliceEnabled) {
     const sc = computeSliceWorldCoord(b, view);
     if (view.sliceAxis === 'x') {
       o = appendQuad(out, o, [sc, minY, maxZ], [sc, minY, minZ], [sc, maxY, minZ], [sc, maxY, maxZ], [1, 0, 0], 1);
-      o = appendQuad(out, o, [sc, minY, minZ], [sc, minY, maxZ], [sc, maxY, maxZ], [sc, maxY, minZ], [-1, 0, 0], 1);
     } else {
       o = appendQuad(out, o, [minX, minY, sc], [maxX, minY, sc], [maxX, maxY, sc], [minX, maxY, sc], [0, 0, 1], 1);
-      o = appendQuad(out, o, [maxX, minY, sc], [minX, minY, sc], [minX, maxY, sc], [maxX, maxY, sc], [0, 0, -1], 1);
     }
   }
   return o / 7;
@@ -600,6 +599,10 @@ class WebGPUBackend {
   private uniformBuf: GPUBuffer;
   private uniformBufOcc: GPUBuffer;
   private linearSampler: GPUSampler;
+  private sdfGi: FastSdfGiSystem;
+  private splatPass: ProceduralSplatPass;
+  private lastGiSig = '';
+  private giTick = 0;
 
   private soilTex: GPUTexture | null = null;
   private soilTexDims: [number, number, number] = [0, 0, 0];
@@ -608,6 +611,8 @@ class WebGPUBackend {
 
   private soilBindGroupLayout: GPUBindGroupLayout;
   private soilBindGroup: GPUBindGroup | null = null;
+  private litBindGroupLayout: GPUBindGroupLayout;
+  private litBindGroup: GPUBindGroup;
   private simpleBindGroupLayout: GPUBindGroupLayout;
   private simpleBindGroup: GPUBindGroup;
   private occBindGroup: GPUBindGroup;
@@ -619,7 +624,6 @@ class WebGPUBackend {
   private solidPipe: GPURenderPipeline;
   private glassPipe: GPURenderPipeline;
   private linePipe: GPURenderPipeline;
-  private sporePipe: GPURenderPipeline;
   private streamPipe: GPURenderPipeline;
 
   private quadCornerBuf: GPUBuffer;
@@ -635,9 +639,6 @@ class WebGPUBackend {
   private mushIdxCap = 0;
   private mycSegBuf: GPUBuffer;
   private mycSegCap = 0;
-  private sporePosBuf: GPUBuffer;
-  private sporeVelBuf: GPUBuffer;
-  private sporeCap = 0;
 
   constructor(device: GPUDevice, context: GPUCanvasContext, format: GPUTextureFormat) {
     this.device = device;
@@ -661,12 +662,35 @@ class WebGPUBackend {
       addressModeW: 'clamp-to-edge',
     });
 
+    this.sdfGi = new FastSdfGiSystem(device);
+
     this.soilBindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+      ],
+    });
+
+    this.litBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '3d' } },
+      ],
+    });
+
+    this.litBindGroup = device.createBindGroup({
+      layout: this.litBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuf } },
+        { binding: 1, resource: this.sdfGi.sdfView },
+        { binding: 2, resource: this.linearSampler },
+        { binding: 3, resource: this.sdfGi.radViewB },
       ],
     });
 
@@ -712,6 +736,7 @@ class WebGPUBackend {
     });
 
     const simpleLayout = device.createPipelineLayout({ bindGroupLayouts: [this.simpleBindGroupLayout] });
+    const litLayout = device.createPipelineLayout({ bindGroupLayouts: [this.litBindGroupLayout] });
 
     const mycMod = device.createShaderModule({ code: MYCELIUM_WGSL });
     const mycVertBuffers: GPUVertexBufferLayout[] = [
@@ -749,7 +774,7 @@ class WebGPUBackend {
 
     const mushMod = device.createShaderModule({ code: MUSHROOM_WGSL });
     this.mushPipe = device.createRenderPipeline({
-      layout: simpleLayout,
+      layout: litLayout,
       vertex: {
         module: mushMod,
         entryPoint: 'vs_main',
@@ -779,7 +804,7 @@ class WebGPUBackend {
       ],
     }];
     this.solidPipe = device.createRenderPipeline({
-      layout: simpleLayout,
+      layout: litLayout,
       vertex: { module: solidMod, entryPoint: 'vs_main', buffers: solidBuffers },
       fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
@@ -787,7 +812,7 @@ class WebGPUBackend {
       multisample: { count: 4 },
     });
     this.glassPipe = device.createRenderPipeline({
-      layout: simpleLayout,
+      layout: litLayout,
       vertex: { module: solidMod, entryPoint: 'vs_main', buffers: solidBuffers },
       fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
@@ -795,29 +820,11 @@ class WebGPUBackend {
       multisample: { count: 4 },
     });
     this.linePipe = device.createRenderPipeline({
-      layout: simpleLayout,
+      layout: litLayout,
       vertex: { module: solidMod, entryPoint: 'vs_main', buffers: solidBuffers },
       fragment: { module: solidMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
       primitive: { topology: 'line-list' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less-equal' },
-      multisample: { count: 4 },
-    });
-
-    const sporeMod = device.createShaderModule({ code: SPORE_WGSL });
-    this.sporePipe = device.createRenderPipeline({
-      layout: simpleLayout,
-      vertex: {
-        module: sporeMod,
-        entryPoint: 'vs_main',
-        buffers: [
-          { arrayStride: 8, stepMode: 'vertex', attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }] },
-          { arrayStride: 16, stepMode: 'instance', attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x4' }] },
-          { arrayStride: 16, stepMode: 'instance', attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x4' }] },
-        ],
-      },
-      fragment: { module: sporeMod, entryPoint: 'fs_main', targets: [{ format, blend: alphaBlend }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
       multisample: { count: 4 },
     });
 
@@ -847,6 +854,16 @@ class WebGPUBackend {
     this.billboardQuadBuf = device.createBuffer({ size: BILLBOARD_QUAD.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(this.billboardQuadBuf, 0, BILLBOARD_QUAD);
 
+    this.splatPass = new ProceduralSplatPass(
+      device,
+      format,
+      this.uniformBuf,
+      this.sdfGi.sdfView,
+      this.linearSampler,
+      this.sdfGi.radViewB,
+      this.billboardQuadBuf,
+    );
+
     this.soilGeomBuf = device.createBuffer({ size: 2048 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.glassGeomBuf = device.createBuffer({ size: 1024 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
     this.lineGeomBuf = device.createBuffer({ size: 2048 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
@@ -859,9 +876,6 @@ class WebGPUBackend {
     this.mushIdxBuf = device.createBuffer({ size: this.mushIdxCap * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
     this.mycSegCap = 4096;
     this.mycSegBuf = device.createBuffer({ size: this.mycSegCap * 32, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.sporeCap = 2048;
-    this.sporePosBuf = device.createBuffer({ size: this.sporeCap * 16, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    this.sporeVelBuf = device.createBuffer({ size: this.sporeCap * 16, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
   }
 
   resize(width: number, height: number): void {
@@ -918,12 +932,24 @@ class WebGPUBackend {
           { binding: 1, resource: this.soilTex.createView({ dimension: '3d' }) },
           { binding: 2, resource: this.linearSampler },
           { binding: 3, resource: this.sporePrintTex.createView({ dimension: '2d' }) },
+          { binding: 4, resource: this.sdfGi.sdfView },
+          { binding: 5, resource: this.sdfGi.radViewB },
         ],
       });
     }
   }
 
+  getSdfBounds(): SdfVolumeBounds {
+    return this.sdfGi.bounds;
+  }
+
   renderFrame(
+    snapshot: SimulationSnapshot,
+    view: ViewState,
+    lightDir: [number, number, number],
+    sliceCoord: number,
+    viewTiltMat: Float32Array,
+    projMat: Float32Array,
     uniformMain: Float32Array,
     uniformOcc: Float32Array,
     soilBytes: Uint8Array,
@@ -1018,19 +1044,31 @@ class WebGPUBackend {
       this.device.queue.writeBuffer(this.mycSegBuf, 0, mycSegData.buffer, mycSegData.byteOffset, mycSegCount * 32);
     }
 
-    if (showSpores && sporeMaxCount > 0) {
-      if (sporeMaxCount > this.sporeCap) {
-        this.sporeCap = Math.max(sporeMaxCount, this.sporeCap * 2);
-        this.sporePosBuf.destroy();
-        this.sporeVelBuf.destroy();
-        this.sporePosBuf = this.device.createBuffer({ size: this.sporeCap * 16, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-        this.sporeVelBuf = this.device.createBuffer({ size: this.sporeCap * 16, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-      }
-      this.device.queue.writeBuffer(this.sporePosBuf, 0, sporePos.buffer, sporePos.byteOffset, sporeMaxCount * 16);
-      this.device.queue.writeBuffer(this.sporeVelBuf, 0, sporeVel.buffer, sporeVel.byteOffset, sporeMaxCount * 16);
+    const encoder = this.device.createCommandEncoder();
+    // Stage 1 Fast-SDF-AO & 2-Bounce World Radiance Volume GI compute pass (throttled when static)
+    this.giTick++;
+    const leadB = snapshot.bodies[0];
+    const giSigImmediate = `${snapshot.species.id}:${snapshot.bodies.length}:${snapshot.obstacles.length}:${view.sliceEnabled ? 1 : 0}:${view.sliceAxis}:${sliceCoord.toFixed(3)}:${lightDir[0].toFixed(2)},${lightDir[1].toFixed(2)},${lightDir[2].toFixed(2)}:${leadB ? Math.round(leadB.stipeLengthM * 250) : 0}:${leadB ? Math.round(leadB.capRadiusM * 250) : 0}`;
+    if (giSigImmediate !== this.lastGiSig || (this.giTick & 3) === 0) {
+      this.lastGiSig = giSigImmediate;
+      this.sdfGi.update(encoder, snapshot, view, lightDir, sliceCoord);
     }
 
-    const encoder = this.device.createCommandEncoder();
+    // Stage 2 Hybrid Procedural 3DGS compute projection & GPU radix sort
+    void sporePos;
+    void sporeVel;
+    void sporeMaxCount;
+    void showSpores;
+    this.splatPass.updateAndSort(
+      encoder,
+      snapshot,
+      view,
+      viewTiltMat,
+      projMat,
+      this.width,
+      this.height,
+    );
+
     const swapView = this.context.getCurrentTexture().createView();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
@@ -1059,7 +1097,7 @@ class WebGPUBackend {
     // 2. Solid obstacles (twigs & stones)
     if (obsVertCount > 0) {
       pass.setPipeline(this.solidPipe);
-      pass.setBindGroup(0, this.simpleBindGroup);
+      pass.setBindGroup(0, this.litBindGroup);
       pass.setVertexBuffer(0, this.obstacleGeomBuf);
       pass.draw(obsVertCount);
     }
@@ -1067,7 +1105,7 @@ class WebGPUBackend {
     // 3. Waxy Chitin SSS Mushrooms
     if (mushVertCount > 0 && mushIndexCount > 0) {
       pass.setPipeline(this.mushPipe);
-      pass.setBindGroup(0, this.simpleBindGroup);
+      pass.setBindGroup(0, this.litBindGroup);
       pass.setVertexBuffer(0, this.mushVertBuf);
       pass.setIndexBuffer(this.mushIdxBuf, 'uint32');
       pass.drawIndexed(mushIndexCount);
@@ -1096,26 +1134,19 @@ class WebGPUBackend {
       pass.draw(streamVertCount);
     }
 
-    // 6. Airborne spore cloud
-    if (showSpores && sporeMaxCount > 0) {
-      pass.setPipeline(this.sporePipe);
-      pass.setBindGroup(0, this.simpleBindGroup);
-      pass.setVertexBuffer(0, this.billboardQuadBuf);
-      pass.setVertexBuffer(1, this.sporePosBuf);
-      pass.setVertexBuffer(2, this.sporeVelBuf);
-      pass.draw(6, sporeMaxCount);
-    }
+    // 6. Sorted Hybrid Procedural 3D Gaussian Splats (moss/litter, mycelial halo, cap fuzz, spore mist)
+    this.splatPass.draw(pass);
 
     // 7. Museum glass walls & optical wireframe hairlines
     if (glassVertCount > 0) {
       pass.setPipeline(this.glassPipe);
-      pass.setBindGroup(0, this.simpleBindGroup);
+      pass.setBindGroup(0, this.litBindGroup);
       pass.setVertexBuffer(0, this.glassGeomBuf);
       pass.draw(glassVertCount);
     }
     if (lineVertCount > 0) {
       pass.setPipeline(this.linePipe);
-      pass.setBindGroup(0, this.simpleBindGroup);
+      pass.setBindGroup(0, this.litBindGroup);
       pass.setVertexBuffer(0, this.lineGeomBuf);
       pass.draw(lineVertCount);
     }
@@ -1125,6 +1156,8 @@ class WebGPUBackend {
   }
 
   dispose(): void {
+    this.splatPass.dispose();
+    this.sdfGi.dispose();
     this.msaaColorTex?.destroy();
     this.depthTex?.destroy();
     this.soilTex?.destroy();
@@ -1141,8 +1174,6 @@ class WebGPUBackend {
     this.mushVertBuf.destroy();
     this.mushIdxBuf.destroy();
     this.mycSegBuf.destroy();
-    this.sporePosBuf.destroy();
-    this.sporeVelBuf.destroy();
   }
 }
 
@@ -1542,6 +1573,7 @@ export class TerrariumRenderer {
   private projMat = new Float32Array(16);
   private viewMat = new Float32Array(16);
   private tiltMat = new Float32Array(16);
+  private viewTiltMat = new Float32Array(16);
   private vpMat = new Float32Array(16);
   private mvpMat = new Float32Array(16);
   private invMvpMat = new Float32Array(16);
@@ -1583,6 +1615,10 @@ export class TerrariumRenderer {
         const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
         if (adapter) {
           const device = await adapter.requestDevice();
+          device.addEventListener('uncapturederror', (ev) => {
+            const err = (ev as GPUUncapturedErrorEvent).error;
+            console.error('WebGPU uncaptured error:', err?.message ?? ev);
+          });
           const ctx = canvas.getContext('webgpu');
           if (ctx) {
             const format = navigator.gpu.getPreferredCanvasFormat();
@@ -1646,9 +1682,11 @@ export class TerrariumRenderer {
     if (Math.abs(visualTilt) > 1e-5) {
       mat4RotationZ(visualTilt, this.tiltMat);
       mat4Multiply(this.vpMat, this.tiltMat, this.mvpMat);
+      mat4Multiply(this.viewMat, this.tiltMat, this.viewTiltMat);
     } else {
       mat4Identity(this.tiltMat);
       this.mvpMat.set(this.vpMat);
+      this.viewTiltMat.set(this.viewMat);
     }
     return eye;
   }
@@ -1695,6 +1733,27 @@ export class TerrariumRenderer {
     u[45] = bounds.ny;
     u[46] = bounds.nz;
     u[47] = snapshot.env.ambientHumidity;
+
+    const sdfBounds = this.gpuBackend?.getSdfBounds() ?? {
+      minX: bounds.minX - 0.02,
+      minY: -0.05,
+      minZ: bounds.minZ - 0.02,
+      maxX: bounds.maxX + 0.02,
+      maxY: 0.27,
+      maxZ: bounds.maxZ + 0.02,
+    };
+    const sdfVoxelSize = (sdfBounds.maxX - sdfBounds.minX) / SDF_NX;
+    const rawRx = this.viewMat[0], rawRy = this.viewMat[4], rawRz = this.viewMat[8];
+    const rawUx = this.viewMat[1], rawUy = this.viewMat[5], rawUz = this.viewMat[9];
+    const localRightX = rawRx * cT - rawRy * sT;
+    const localRightY = rawRx * sT + rawRy * cT;
+    const localUpX = rawUx * cT - rawUy * sT;
+    const localUpY = rawUx * sT + rawUy * cT;
+
+    u[48] = sdfBounds.minX; u[49] = sdfBounds.minY; u[50] = sdfBounds.minZ; u[51] = sdfVoxelSize;
+    u[52] = sdfBounds.maxX; u[53] = sdfBounds.maxY; u[54] = sdfBounds.maxZ; u[55] = 1.0;
+    u[56] = localRightX; u[57] = localRightY; u[58] = rawRz; u[59] = this.pixelWidth;
+    u[60] = localUpX; u[61] = localUpY; u[62] = rawUz; u[63] = this.pixelHeight;
 
     // Occluded subterranean mycelium uniform copy (soft translucent window through dark earth)
     this.uniformOcc.set(u);
@@ -1801,6 +1860,12 @@ export class TerrariumRenderer {
 
     if (this.gpuBackend) {
       this.gpuBackend.renderFrame(
+        snapshot,
+        view,
+        lDir,
+        sliceCoord,
+        this.viewTiltMat,
+        this.projMat,
         this.uniformMain,
         this.uniformOcc,
         this.soilTexScratch,

@@ -315,3 +315,18 @@ All verification tests were executed against the SHA-256-locked independent orac
 5. **Interactive 60 FPS Multi-Rate Operator Splitting:**
    - A full `48×32×48` (73,728-voxel) soil step required $\sim 72\text{–}130\text{ ms}$ in V8, whereas `32×22×32` at $\Delta x = 0.015\text{ m}$ preserves the exact $0.48 \times 0.33 \times 0.48\text{ m}$ terrarium volume at $27.9\text{ ms}$ per $1800\text{ s}$ step ($4.6\times$ speedup). Coupling `SoilGrid`'s default `48×32×48` in unit oracles with `32×22×32` + multi-rate stepping in `SimulationEngine` sustains smooth `33–60 FPS` native WebGPU rendering on Apple Silicon while keeping `fastForward(260_000 s)` well within interactive responsiveness.
 
+### 9.3 Stage 1 (`Fast-SDF-AO` / GI) & Stage 2 (Hybrid Procedural 3D Gaussian Splatting) Rendering Pipeline
+
+- **Stage 1 — Live FP16 SDF, 4-Tap AO, Soft Shadows, 2-Bounce GI & Smooth Soil (`src/render/FastSdfGi.ts`, `src/render/shaders.ts`, `src/render/TerrariumRenderer.ts`):**
+  - **Domain-warped 8-corner trilinear soil blending + triplanar micro-bump normals:** Eliminates voxel blockiness across sand lenses, clay pockets, rotting oak logs, and mossy humus while keeping scientific X-ray data channels unwarped.
+  - **Coplanar Razor-Slice Z-fighting fix:** Removed duplicate back-to-back slice quads in `buildSoilAndSliceMesh` and oriented slice normals via `@builtin(front_facing)`.
+  - **`FastSdfGiSystem` (64×48×64 `rgba16float` 3D compute pipeline, inspired by `wrong-nebula/Fast-SDF-AO`):**
+    1. `cs_bake_sdf`: Packs up to 192 live stipe capsules, species cap hulls, twigs/stones, soil box, and active razor slice plane into a 1-Lipschitz FP16 3D SDF + surface albedo volume.
+    2. `cs_inject_bounce1` & `cs_propagate_bounce2`: Evaluates 10-step soft SDF penumbra shadows and propagates 14-direction multi-radius radiance into a 2-bounce World Radiance Volume (`radTexB`).
+    3. Surface shaders (`SOIL_WGSL`, `MUSHROOM_WGSL`, `SOLID_WGSL`) evaluate 4-tap normal-offset **Fast-SDF-AO**, SDF-gradient **bent normals**, 12-step soft SDF shadows, 4-cone 2-bounce colored GI bounce, backlit chitin SSS, and Narkowicz ACES filmic tone mapping.
+- **Stage 2 — Hybrid WebGPU Procedural 3D Gaussian Splatting (`src/render/ProceduralSplatPass.ts`):**
+  - **Physics-Driven Procedural Splat Synthesis (`MAX_SPLATS = 65536`, zero-GC):** Seeds 3D forest-floor moss tufts / humus crumbs / leaf litter / bark splinters from `SoilGrid` (cached per soil state), subtle feathery halos along `MyceliumNetwork` segments, tangent-aligned cap velum scales & basal rhizomorph fuzz from `FruitingRenderMesh`, and velocity-stretched Tyndall volumetric spore mist + crisp spore nuclei from `SporePhysicsSystem`.
+  - **100% GPU Compute Projection + 2-Pass 8-Bit GPU LSD Radix Sort:** `cs_project_splats` clips against the razor slice, hides non-X-ray surface/cap splats when `xrayMode !== 'none'`, lights splats dynamically against `FastSdfGiSystem`, computes Zwicker/Kerbl EWA 2D covariance matrices, and feeds a race-free 2-pass 8-bit GPU LSD radix sort (`cs_radix_hist` → `cs_radix_prefix` → `cs_radix_scatter`) before premultiplied Gaussian quad compositing depth-tested (`depthCompare: 'less'`) against opaque geometry.
+  - **Live Verified WebGPU Performance (Apple Silicon Chrome `--enable-unsafe-webgpu`, `1440×900`):** `32–40 FPS` across all 6 Stage-2 captures with `0` console errors, `0` page errors, and `ORACLE.sha256` intact.
+
+
