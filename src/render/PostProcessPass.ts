@@ -37,7 +37,7 @@ ${POST_VS_WGSL}
 struct PostUniforms {
   params0: vec4<f32>, // x = texelW, y = texelH, z = bloomThreshold, w = bloomStrength
   params1: vec4<f32>, // x = focusDistM, y = dofStrength, z = xrayMode, w = sliceEnabled
-  params2: vec4<f32>, // x = near, y = far, z = blurDirX, w = blurDirY
+  params2: vec4<f32>, // x = near, y = far, z = blurDirX (or lightingMood on extract), w = blurDirY
 };
 
 @group(0) @binding(0) var<uniform> u: PostUniforms;
@@ -51,7 +51,7 @@ fn fs_bloom_extract(in: FullVertOut) -> @location(0) vec4<f32> {
   }
   let c = textureSampleLevel(srcTex, linearSamp, in.uv, 0.0).rgb;
   let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-  let thr = u.params0.z;
+  let thr = select(u.params0.z, min(u.params0.z, 0.68), u.params2.z > 2.5);
   let knee = thr * 0.45;
   let soft = clamp(luma - thr + knee, 0.0, 2.0 * knee);
   let contrib = max(luma - thr, (soft * soft) / max(4.0 * knee, 1e-4));
@@ -79,7 +79,7 @@ ${POST_VS_WGSL}
 struct PostUniforms {
   params0: vec4<f32>, // x = texelW, y = texelH, z = bloomThreshold, w = bloomStrength
   params1: vec4<f32>, // x = focusDistM, y = dofStrength, z = xrayMode, w = sliceEnabled
-  params2: vec4<f32>, // x = near, y = far, z = lightingMood (0/1/2), w = realTimeSec
+  params2: vec4<f32>, // x = near, y = far, z = lightingMood (0/1/2/3), w = realTimeSec
 };
 
 @group(0) @binding(0) var<uniform> u: PostUniforms;
@@ -143,6 +143,8 @@ fn fs_composite(in: FullVertOut) -> @location(0) vec4<f32> {
   }
 
   var color = baseHdr;
+  let mood = u.params2.z;
+  let isNocturnal = mood > 2.5;
 
   // Depth-weighted 9-tap Vogel disk bokeh DoF in Natural + un-sliced view
   let dofStrength = u.params1.y;
@@ -159,7 +161,7 @@ fn fs_composite(in: FullVertOut) -> @location(0) vec4<f32> {
 
       if (centerCoc > 0.015) {
         let texel = vec2<f32>(u.params0.x, u.params0.y);
-        let radiusPx = centerCoc * 5.2;
+        let radiusPx = centerCoc * select(5.2, 6.8, isNocturnal);
         let rotAngle = interleavedGradientNoise(in.clipPos.xy) * 6.2831853;
         let goldenAngle = 2.39996323;
 
@@ -198,8 +200,7 @@ fn fs_composite(in: FullVertOut) -> @location(0) vec4<f32> {
   }
 
   // Physical HDR bloom + mood grading + vignette + ACES filmic + sRGB + micro-grain
-  let mood = u.params2.z;
-  let bloomBoost = select(1.0, 1.18, mood >= 1.5);
+  let bloomBoost = select(select(1.0, 1.18, mood >= 1.5 && mood < 2.5), 1.65, isNocturnal);
   let bloom = textureSampleLevel(bloomTex, linearSamp, in.uv, 0.0).rgb;
   color += bloom * (u.params0.w * bloomBoost);
 
@@ -213,7 +214,7 @@ fn fs_composite(in: FullVertOut) -> @location(0) vec4<f32> {
     color *= vignette;
     color = color * vec3<f32>(1.04, 1.00, 0.91) * 1.03 + vec3<f32>(0.0024, 0.0017, 0.0008);
     mapped = acesFilmic(color);
-  } else if (mood >= 1.5) {
+  } else if (mood >= 1.5 && mood < 2.5) {
     // Mood 2: Dark-Field Backlit deep shadows & luminous rim contrast
     let vignette = 1.0 - r2 * 0.30;
     color *= vignette;
@@ -223,6 +224,15 @@ fn fs_composite(in: FullVertOut) -> @location(0) vec4<f32> {
     let moodTint = mix(vec3<f32>(0.92, 0.96, 1.04), vec3<f32>(1.04, 1.00, 0.95), smoothstep(0.04, 0.45, luma));
     color = color * mix(0.66, 1.04, toe) * lumLift * moodTint;
     mapped = acesFilmic(color * 1.02);
+  } else if (mood >= 2.5) {
+    // Mood 3: Nocturnal dark-adapted photographic filmic lift + deep cool blue-black shadows
+    let vignette = 1.0 - r2 * 0.28;
+    color *= vignette;
+    let luma = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let shadowToe = smoothstep(0.0, 0.055, luma);
+    let coolShadow = mix(vec3<f32>(0.76, 0.88, 1.14), vec3<f32>(1.0, 1.0, 1.0), smoothstep(0.015, 0.18, luma));
+    color = color * mix(0.68, 1.0, shadowToe) * coolShadow + vec3<f32>(0.0005, 0.0012, 0.0030);
+    mapped = acesFilmic(color * 1.18);
   } else {
     // Mood 0: Studio neutral contrast
     let vignette = 1.0 - r2 * 0.20;
@@ -450,10 +460,11 @@ export class PostProcessPass {
     }
 
     const wrappedTime = ((realTimeSec % 600) + 600) % 600;
+    const isNocturnal = lightingMood > 2.5;
     const u = this.uniformScratch;
     u[0] = 1 / Math.max(1, this.width);
     u[1] = 1 / Math.max(1, this.height);
-    u[2] = 1.08; // bloom threshold
+    u[2] = isNocturnal ? 0.68 : 1.08; // bloom threshold
     u[3] = bloomStrength;
     u[4] = focusDistM;
     u[5] = dofStrength;

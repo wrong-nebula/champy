@@ -353,10 +353,11 @@ fn fs_main(in: BotVertOut, @builtin(front_facing) frontFacing: bool) -> @locatio
   let gi = evalSdfGI(in.worldPos + n * 0.005, n, bentN);
 
   // Lighting mood & drifting warm dappled leaf-canopy gobo from u.padExtra
-  // u.padExtra: x = lightingMood (0 Studio, 1 Canopy, 2 Dark-Field Backlit), y = realTimeSec, z = goboStrength
+  // u.padExtra: x = lightingMood (0 Studio, 1 Canopy, 2 Dark-Field Backlit, 3 Nocturnal), y = realTimeSec, z = goboStrength
   let mood = u.padExtra.x;
   let realTimeSec = u.padExtra.y;
   let goboStrength = clamp(u.padExtra.z, 0.0, 1.0);
+  let isNocturnal = smoothstep(2.4, 2.9, mood);
 
   var goboTint = vec3<f32>(1.0);
   if (goboStrength > 0.01) {
@@ -374,7 +375,7 @@ fn fs_main(in: BotVertOut, @builtin(front_facing) frontFacing: bool) -> @locatio
   }
 
   let isCanopy = mood >= 0.5 && mood <= 1.5;
-  let isBacklit = mood > 1.5;
+  let isBacklit = mood > 1.5 && mood <= 2.45;
 
   let sunBaseCol = select(
     vec3<f32>(0.96, 0.90, 0.78),
@@ -390,21 +391,27 @@ fn fs_main(in: BotVertOut, @builtin(front_facing) frontFacing: bool) -> @locatio
 
   // 3-point macro botanical lighting (sun key + bent sky fill + grazing rim SSS)
   let wrapNdl = clamp((dot(n, l) + 0.42) / 1.42, 0.0, 1.0);
-  let sun = sunBaseCol * goboTint * wrapNdl * mix(0.22, 1.0, shadow);
-  let sky = mix(skyLow, skyHigh, bentN.y * 0.5 + 0.5);
+  let sunDay = sunBaseCol * goboTint * wrapNdl * mix(0.22, 1.0, shadow);
+  let skyDay = mix(skyLow, skyHigh, bentN.y * 0.5 + 0.5);
+  let moonSky = vec3<f32>(0.015, 0.025, 0.045) * (0.72 + 0.28 * (bentN.y * 0.5 + 0.5));
+  let sky = mix(skyDay, moonSky, isNocturnal);
+  let sun = mix(sunDay, sunDay * vec3<f32>(0.72, 0.84, 1.05) * 0.07, isNocturnal);
 
   let sssAlign = pow(clamp(dot(v, -l + n * 0.35), 0.0, 1.0), 2.3);
   let grazingFresnel = pow(1.0 - max(dot(n, v), 0.0), 2.6);
   let moodSssMult = select(select(1.0, 1.32, isCanopy), 2.65, isBacklit);
   let backSss = (sssAlign * 0.22 + grazingFresnel * select(0.03, 0.20, isBacklit))
-    * moodSssMult * sssWeight * (0.35 + 0.65 * shadow);
+    * moodSssMult * sssWeight * (0.35 + 0.65 * shadow) * mix(1.0, 0.07, isNocturnal);
 
   // Linear HDR output parity (strictly srgb -> linear, no premature gamma/ACES)
   let albedo = srgbToLinear(srgbAlbedo);
   let sssTint = albedo * sssHue;
-  let spec = pow(max(dot(n, h), 0.0), specPow) * specStr * shadow * sdfAo * sunBaseCol * goboTint;
+  let specLight = mix(sunBaseCol, sunBaseCol * vec3<f32>(0.72, 0.84, 1.05) * 0.07, isNocturnal);
+  let spec = pow(max(dot(n, h), 0.0), specPow) * specStr * shadow * sdfAo * specLight * goboTint;
+  let giGain = mix(0.52, 1.35, isNocturnal);
+  let wetGiSheen = gi * (0.06 * wet * isNocturnal * sdfAo);
 
-  let color = albedo * ((sky + sun) * sdfAo + gi * 0.52) + sssTint * backSss + spec;
+  let color = albedo * ((sky + sun) * sdfAo + gi * giGain) + sssTint * backSss + spec + wetGiSheen;
   return vec4<f32>(color, 1.0);
 }
 `;
